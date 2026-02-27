@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Training / run artifacts
+wandb/
+outputs/
+logs/
+*.ckpt
+*.safetensors
+
+# Large or local data (demo WebDatasets are large; host separately or download from release)
+demo_chest/
+demo_fundus/
+# real_chest/split_data.csv
+
+# OS
+.DS_Store
+Thumbs.db

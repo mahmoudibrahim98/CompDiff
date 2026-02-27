@@ -1,0 +1,44 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+diffusers>=0.27.0
+accelerate>=0.20.0
+huggingface_hub>=0.16.0  # Required for model loading and RepositoryNotFoundError
+
+# Data processing
+numpy>=1.24.0
+pillow>=9.5.0
+pyyaml>=6.0
+webdataset>=0.2.0
+safetensors>=0.3.0  # Required for loading model checkpoints
+
+# Validation and metrics (required for validation_metrics.py)
+torchxrayvision>=0.0.30  # For X-ray specific metrics
+scikit-learn>=1.3.0  # For ROC-AUC, accuracy, and other metrics
+scipy>=1.10.0  # For statistical functions (sqrtm, etc.)
+torchmetrics>=0.11.0  # For FID, MIFID, Inception Score
+scikit-image>=0.20.0  # For SSIM (structural similarity)
+
+# Logging and monitoring
+wandb>=0.15.0  # For experiment tracking (optional but recommended)
+
+# Performance optimizations (optional but recommended)
+xformers>=0.0.20  # For memory-efficient attention
+bitsandbytes>=0.41.0  # For 8-bit Adam optimizer
+
+# FairDiffusion dependencies (required if using FairDiffusion)
+botorch>=0.8.0  # For Bayesian optimization in FairDiffusion
+gpytorch>=1.4.0  # For Gaussian processes in FairDiffusion
+
+# FairCLIP dependencies (optional, only if using FairCLIP regularizer)
+# clip-by-openai>=1.0  # Uncomment if using FairCLIP
+# geomloss>=0.3.0  # Uncomment if using FairCLIP Sinkhorn loss
+
+# Fairness metrics (optional, for fairness evaluation)
+fairlearn>=0.9.0  # For demographic parity and equalized odds metrics
+
+# Note: 
+# - For CUDA support, ensure you install PyTorch with CUDA from pytorch.org
+# - Some packages may require specific CUDA versions
+# - FairCLIP dependencies (clip, geomloss) are optional and only needed if using FairCLIP regularizer

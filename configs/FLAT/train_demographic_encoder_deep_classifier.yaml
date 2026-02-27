@@ -1,0 +1,135 @@
+# RoentGen V0.5: Demographic Encoder Training Configuration
+#
+# V0.5 uses a simplified demographic encoder that separates demographic conditioning
+# from clinical text conditioning. This avoids CLIP's 77-token bottleneck and enables
+# clean separation of concerns.
+#
+# Key changes from V4:
+# - Aux loss on individual embeddings (not fused representation)
+# - Option for single fused token (mode='single') or 3 separate tokens (mode='separate')
+# - No dropout in fusion MLP (simplified architecture)
+#
+# Architecture:
+#   Single mode: Embeddings → Fusion → [B, 1, d_output]
+#   Separate mode: Embeddings → Separate Proj → [B, 3, d_output]
+#   Aux loss: Applied directly to individual embeddings (e_age, e_sex, e_race)
+#
+# ==============================================================================
+# MODEL CONFIGURATION
+# ==============================================================================
+
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
+pretrained_text_encoder_name_or_path: null
+train_text_encoder: True
+
+embedding_method: "last_hidden_state"
+enforce_tokenizer_max_sentence_length: 77
+output_dir: "./outputs_summarized/v4/4_demographic_encoder_rerun_deep_classifier"
+seed: 42
+resolution: 512
+
+train_batch_size: 16
+max_train_steps: 30000
+max_actual_train_steps: 12500
+learning_rate: 1.0e-5
+gradient_accumulation_steps: 1
+mixed_precision: "bf16"
+use_ema: true
+lr_scheduler: "cosine"
+lr_warmup_steps: 500
+gradient_checkpointing: true
+
+# ==============================================================================
+# DATASET CONFIGURATION
+# ==============================================================================
+
+use_wds_dataset: true
+url_root: "./demo_chest/training_data"
+image_type: "pt"
+
+# ==============================================================================
+# CHECKPOINTING
+# ==============================================================================
+
+checkpointing_steps: 500
+checkpoints_total_limit: None
+resume_from_checkpoint: "latest"
+
+# ==============================================================================
+# HCN (DISABLED FOR V4)
+# ==============================================================================
+# V4 uses DemographicEncoder instead of HCN
+use_hcn: false
+hcn_d_node: 256
+hcn_d_ctx: 1024
+hcn_dropout: 0.1
+hcn_use_uncertainty: true
+hcn_num_age_bins: 5
+hcn_num_sex: 2
+hcn_num_race: 4
+hcn_kl_weight: 0.005
+hcn_kl_anneal_steps: 5000
+hcn_comp_weight: 0.01
+hcn_aux_weight: 0.1
+
+# ==============================================================================
+# DEMOGRAPHIC ENCODER (V0.5)
+# ==============================================================================
+
+# Enable DemographicEncoder for clean demographic conditioning
+use_demographic_encoder: true
+
+# Architecture parameters
+demo_d_hidden: 256              # Hidden dimension for embeddings
+demo_d_output: 1024             # Output dimension (matches text encoder)
+demo_mode: "single"             # 'single' (fused token) or 'separate' (3 tokens)
+
+demo_classifier_depth: "deep"
+demo_aux_hidden_dim: 512  # Optional, defaults to 512
+demo_dropout: 0.1         # Used for deep classifiers
+
+# Number of categories for each demographic attribute
+demo_num_age_bins: 5            # Age bins: [0-18, 18-40, 40-60, 60-80, 80+]
+demo_num_sex: 2                 # Sex: [Male, Female]
+demo_num_race: 4                # Race: [White, Black, Asian, Hispanic]
+
+# Loss weights
+demo_aux_weight: 1.0            # Strong auxiliary loss on individual embeddings
+
+# # Dropout strategy (optional - set to false for more stable training)
+# demo_use_dropout: false         # Whether to randomly remove demographics from text
+# demo_text_dropout_prob: 0.5     # Probability of removing demographics (if enabled)
+# demo_dropout_start_step: 0      # Step to start dropout (0 = from beginning)
+
+# Optional: Path to pretrained demographic encoder
+demographic_encoder_pretrained_path: null
+
+# ==============================================================================
+# VALIDATION CONFIGURATION
+# ==============================================================================
+
+run_validation: true
+validation_steps: 2500
+validation_schedule_offsets:
+  - -1500
+  - 0
+num_validation_samples: -1
+val_batch_size: 8
+validation_csv: null
+validation_images_dir: "./demo_chest/val_data"
+validation_sex_model_path: "./pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt"
+validation_num_images_per_prompt: 1
+validation_guidance_scale: 7.5
+validation_num_inference_steps: 75
+validation_save_images: true
+validation_metrics_batch_size: 8
+compute_subgroup_metrics: true
+strip_demographics_in_validation: true
+# ==============================================================================
+# LOGGING
+# ==============================================================================
+
+logging_dir: "logs"
+report_to: "wandb"
+
+

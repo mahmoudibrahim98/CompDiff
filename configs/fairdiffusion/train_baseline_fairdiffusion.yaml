@@ -1,0 +1,177 @@
+# RoentGen-v2 Training Configuration - Baseline with FairDiffusion
+#
+# This config enables FairDiffusion (fair Bayesian perturbation) without HCN
+# FairDiffusion adaptively reweights training samples based on demographic groups
+# to reduce performance gaps across different demographic attributes
+#
+# ==============================================================================
+# MODEL CONFIGURATION
+# ==============================================================================
+
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
+pretrained_text_encoder_name_or_path: null
+train_text_encoder: True
+
+embedding_method: "last_hidden_state"
+enforce_tokenizer_max_sentence_length: 77
+output_dir: "./outputs/fairdiffusion/train_baseline_fairdiffusion"
+seed: 42
+resolution: 512
+
+train_batch_size: 16
+max_train_steps: 30000
+learning_rate: 1.0e-5
+gradient_accumulation_steps: 1
+mixed_precision: "bf16"
+use_ema: true
+lr_scheduler: "cosine"
+lr_warmup_steps: 500
+gradient_checkpointing: true
+
+# ==============================================================================
+# DATASET CONFIGURATION
+# ==============================================================================
+
+use_wds_dataset: true
+url_root: "./demo_chest/training_data"
+image_type: "pt"
+
+# ==============================================================================
+# TEST DATASET Generation
+# ==============================================================================
+
+
+wds_dataset_path: "./demo_chest/training_data"
+num_images_per_prompt: 1
+generation_batch_size: 16
+generation_checkpoint_path: null  # Set after training, e.g. ./outputs/fairdiffusion/train_baseline_fairdiffusion/checkpoint-7500
+# ==============================================================================
+# CHECKPOINTING
+# ==============================================================================
+
+checkpointing_steps: 500
+checkpoints_total_limit: None
+resume_from_checkpoint: "latest"
+
+
+# ==============================================================================
+# STRIP DEMOGRAPHICS
+# ==============================================================================
+
+strip_demographics: false
+
+# ==============================================================================
+# HCN (HIERARCHICAL CONDITIONER NETWORK)
+# ==============================================================================
+# HCN is disabled for baseline FairDiffusion training
+# FairDiffusion will parse demographics from prompts automatically
+use_hcn: false
+# These values are still used by FairDiffusion to infer attribute cardinalities
+hcn_d_node: 256
+hcn_d_ctx: 1024
+hcn_dropout: 0.1
+hcn_use_uncertainty: true
+hcn_num_age_bins: 5
+hcn_num_sex: 2
+hcn_num_race: 4
+hcn_kl_weight: 0.005
+hcn_kl_anneal_steps: 5000
+hcn_comp_weight: 0.01
+hcn_aux_weight: 0
+
+# ==============================================================================
+# DEMOGRAPHIC ENCODER (V4)
+# ==============================================================================
+
+# Enable DemographicEncoder for clean demographic conditioning
+use_demographic_encoder: false
+
+# Architecture parameters
+demo_d_hidden: 256              # Hidden dimension for embeddings
+demo_d_output: 1024             # Output dimension (matches text encoder)
+demo_dropout: 0.1               # Dropout in MLP
+
+# Number of categories for each demographic attribute
+demo_num_age_bins: 5            # Age bins: [0-18, 18-40, 40-60, 60-80, 80+]
+demo_num_sex: 2                 # Sex: [Male, Female]
+demo_num_race: 4                # Race: [White, Black, Asian, Hispanic]
+
+# Loss weights
+demo_aux_weight: 1.0            # Strong auxiliary loss to force meaningful embeddings
+
+# Dropout strategy (optional - set to false for more stable training)
+demo_use_dropout: false         # Whether to randomly remove demographics from text
+demo_text_dropout_prob: 0    # Probability of removing demographics (if enabled)
+demo_dropout_start_step: 0      # Step to start dropout (0 = from beginning)
+
+# Optional: Path to pretrained demographic encoder
+demographic_encoder_pretrained_path: null
+
+# ==============================================================================
+# FAIRDIFFUSION (Fair Bayesian Perturbation)
+# ==============================================================================
+# Enable FairDiffusion for adaptive fairness-aware training
+# FairDiffusion uses Bayesian optimization to adaptively reweight samples
+# based on demographic groups to reduce performance gaps
+use_fairdiffusion: true #Enable FairDiffusion adaptive reweighting
+fairdiffusion_input_perturbation: 0.1 #Input noise perturbation scale (recommended: 0.1)
+fairdiffusion_time_window: 30 #Steps between Bayesian optimization updates
+fairdiffusion_exploitation_rate: 0.95 #Exploration vs exploitation balance (0-1, higher = more exploitation)
+fairdiffusion_sigma_init: 1.0 #Initial sigma value for perturbation sampling
+fairdiffusion_sigma_min: 0.0 #Minimum sigma bound
+fairdiffusion_sigma_max: 1.0 #Maximum sigma bound
+fairdiffusion_min_instance_weight: 0.1 #Minimum per-sample weight (prevents extreme downweighting)
+fairdiffusion_ucb_beta: 0.1 #Upper Confidence Bound beta parameter for BO acquisition
+# Attribute fields to use for fairness (demographics parsed from prompts)
+fairdiffusion_attribute_fields: ["race_idx", "sex_idx", "age_idx"]
+# Optional: override attribute cardinalities if different from defaults
+# fairdiffusion_attribute_cardinalities: {}
+
+# ==============================================================================
+# VALIDATION CONFIGURATION
+# ==============================================================================
+
+run_validation: true
+validation_steps: 2500
+validation_schedule_offsets:  # . For example, with validation_steps: 2500 and validation_schedule_offsets: [-1500, 0], the monitor checks steps {2500*k - 1500, 2500*k} → 1000, 2500, 3500, 5000, etc.
+  - -1500
+  - 0
+num_validation_samples: -1
+val_batch_size: 8
+validation_csv: null
+validation_images_dir: "./demo_chest/val_data"
+validation_sex_model_path: "./pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt"
+validation_num_images_per_prompt: 1
+validation_guidance_scale: 7.5
+validation_num_inference_steps: 75
+validation_save_images: true
+validation_metrics_batch_size: 8
+compute_subgroup_metrics: true
+strip_demographics_in_validation: false
+
+
+# ==============================================================================
+# VALIDATION CONFIGURATION
+# ==============================================================================
+
+
+test_csv: "./demo_chest/test_data"
+test_images_dir: "./demo_chest/test_data"
+test_dir: "./demo_chest/test_data"
+train_dir: "./demo_chest/training_data"
+
+# ==============================================================================
+# GROUND TRUTH (GT) DATASET CONFIGURATION
+# ==============================================================================
+# Configuration for generating synthetic images from GT dataset
+# When run in gt_mode, this will use GT_data as the source dataset
+
+GT_dir: null
+gt_dir: null
+# ==============================================================================
+# LOGGING
+# ==============================================================================
+
+logging_dir: "logs_summarized"
+report_to: "wandb"
+

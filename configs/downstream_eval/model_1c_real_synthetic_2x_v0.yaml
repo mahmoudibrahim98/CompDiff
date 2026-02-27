@@ -1,0 +1,21 @@
+strategy: 1c
+real_train_path: real_data_summarized/training_data
+real_val_path: real_data_summarized/val_data
+real_test_path: real_data_summarized/test_data
+synthetic_base_path: synthetic_datasets
+model_version: v0
+dataset_name: 0_train_baseline
+num_generations: 2
+from_scratch: false
+initial_lr: 0.0001
+batch_size: 32
+num_workers: 4
+max_epochs: 100
+early_stopping_patience: 20
+mimic_mean: null
+mimic_std: null
+compute_normalization: true
+output_dir: outputs_summarized/downstream_eval
+chexpert_csv_path: src/1_prepare_chexpert/chexpert_filtered.csv
+chexpert_image_base_path: /mnthpc/netapp01/projects/AI4Health/sourcedata/Chest Xray/ChexPert/chexpertchestxrays-u20210408/unzipped_latest/
+evaluate_on_chexpert: true

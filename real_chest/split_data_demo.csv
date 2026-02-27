@@ -1,0 +1,18 @@
+study_id,subject_id,gender,anchor_age,ethnicity,Atelectasis,Cardiomegaly,Consolidation,Edema,Enlarged Cardiomediastinum,Fracture,Lung Lesion,Lung Opacity,No Finding,Pleural Effusion,Pleural Other,Pneumonia,Pneumothorax,Support Devices,image,final_sentence,split
+53189527,10000032,female,52.0,White,,,,,,,,,1.0,,,,,,files/p10/p10000032/s53189527/2a2277a9-b0ded155-c0de8eb9-c124d10e-82c5caab.jpg,52 year old White female. No acute cardiopulmonary abnormality.,train
+50414267,10000032,female,52.0,White,,,,,,,,,1.0,,,,,,files/p10/p10000032/s50414267/02aa804e-bde0afdd-112c0b34-7bc16630-4e384014.jpg,52 year old White female. No acute cardiopulmonary process.,train
+55697293,10000935,female,52.0,Black,,,,,,,,,1.0,,,,,,files/p10/p10000935/s55697293/c50494f1-90e2bff5-e9189550-1a4562fd-6ab5204c.jpg,52 year old Black female. Stable chest radiograph.,train
+50985099,10000980,female,73.0,Black,,,,0.0,,,,,,0.0,,0.0,,,files/p10/p10000980/s50985099/6ad03ed1-97ee17ee-9cf8b320-f7011003-cd93b42d.jpg,"73 year old Black female. Compared to prior CXRs: edema and possible pneumonia resolved; heart top-normal, improved; pleural effusions resolved. Right hilar vessel enlargement (possible PAH). LCx atherosclerotic calcification.",train
+54935705,10000980,female,73.0,Black,,,-1.0,1.0,,,,,,,,-1.0,,,files/p10/p10000980/s54935705/6ad819bb-bae74eb9-7b663e90-b8deabd7-57f8054a.jpg,"73 year old Black female. Mild pulmonary edema with superimposed left upper lung consolidation,
+ potentially more confluent edema versus superimposed infection.",train
+57861150,10000980,female,73.0,Black,,,,0.0,,,,,,1.0,,,,,files/p10/p10000980/s57861150/5aa15ba6-55f5e96e-39cea686-7c3b28b2-b8c97a88.jpg,"73 year old Black female. Interval resolution of previously seen mild pulmonary edema with trace
+ bilateral pleural effusions.",train
+58636672,10000980,female,73.0,Black,,1.0,,,,,,,,1.0,,0.0,,,files/p10/p10000980/s58636672/c7526473-7b7214ee-a5d58d12-29d1f67f-9f4edf00.jpg,"73 year old Black female. As compared to ___, the lung volumes have slightly decreased.  Signs
+ of mild overinflation and moderate pleural effusions persist.  Moderate
+ cardiomegaly.  Elongation of the descending aorta.  No pneumonia.",train
+59988438,10000980,female,73.0,Black,,,,,,,,,,1.0,,,,,files/p10/p10000980/s59988438/925b9496-a956d7b2-05185e52-bb33313b-c06ee522.jpg,"73 year old Black female. Tiny pleural effusions, new. Otherwise unremarkable.",train
+53186264,10001176,female,64.0,White,-1.0,,,,,,,1.0,,,,0.0,,,files/p10/p10001176/s53186264/1fe73f8e-036bd24e-4578c891-33c1746e-864884a7.jpg,"64 year old White female. Mild perihilar prominence, suspected to represent mildly
+ prominent pulmonary vessels without definite pneumonia.  Streaky left basilar
+ opacification seen only on the frontal view is probably due to minor
+ atelectasis or scarring.",train
+54684191,10001176,female,64.0,White,,,,1.0,,,,,,,,,,,files/p10/p10001176/s54684191/3b8b1b7d-054490d5-385641e7-ff43d2c8-9505f058.jpg,64 year old White female. Mild pulmonary edema,train

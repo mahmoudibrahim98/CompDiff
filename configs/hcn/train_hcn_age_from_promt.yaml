@@ -1,0 +1,141 @@
+# HCN Training Configuration - Age from Prompt
+#
+# This config trains HCN with age information kept in the prompt rather than encoded in HCN.
+# 
+# Configuration details:
+# - HCN encodes only sex and race (hcn_encode_age: false)
+# - Age is kept in the text prompt (keep_age_in_prompt: true)
+# - Uses HCN V8 architecture with auxiliary loss on output token
+# - Demographics are stripped from validation prompts for evaluation
+#
+# ==============================================================================
+# MODEL CONFIGURATION
+# ==============================================================================
+
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
+pretrained_text_encoder_name_or_path: null
+train_text_encoder: true
+
+embedding_method: "last_hidden_state"
+enforce_tokenizer_max_sentence_length: 77
+output_dir: "./outputs/hcn/train_hcn_age_from_promt"
+seed: 42
+resolution: 512
+
+train_batch_size: 8
+max_train_steps: 30000
+learning_rate: 1.0e-5
+gradient_accumulation_steps: 1
+mixed_precision: "bf16"
+use_ema: true
+lr_scheduler: "cosine"
+lr_warmup_steps: 500
+gradient_checkpointing: true
+
+# ==============================================================================
+# DATASET CONFIGURATION
+# ==============================================================================
+
+use_wds_dataset: true
+url_root: "./demo_chest/training_data"
+image_type: "pt"
+
+# ==============================================================================
+# TEST DATASET Generation
+# ==============================================================================
+
+
+wds_dataset_path: "./demo_chest/training_data"
+num_images_per_prompt: 1
+generation_batch_size: 16
+generation_checkpoint_path: null  # Set to your checkpoint path after training, e.g. ./outputs/hcn/train_hcn_age_from_promt/checkpoint-20000
+
+
+# ==============================================================================
+# CHECKPOINTING
+# ==============================================================================
+
+checkpointing_steps: 500
+checkpoints_total_limit: None
+resume_from_checkpoint: "latest"
+
+# ==============================================================================
+# HCN (HIERARCHICAL CONDITIONER NETWORK) WITH TIMESTEP INJECTION - V6
+# ==============================================================================
+
+# Enable HCN
+use_hcn: true
+
+# HCN configuration
+# Note: use_hcn_v8 and use_hcn_v7 flags are no longer needed - HCN is now the default
+hcn_encode_age: false
+hcn_aux_hidden_dim: 512  
+
+
+keep_age_in_prompt: true
+keep_age_in_prompt_validation: true
+
+
+hcn_d_node: 256
+hcn_d_ctx: 1024
+hcn_dropout: 0.1
+hcn_use_uncertainty: true
+
+# Number of categories for each demographic attribute
+hcn_num_age_bins: 5
+hcn_num_sex: 2
+hcn_num_race: 4
+
+# Loss weights for HCN
+hcn_kl_weight: 0.005
+hcn_kl_anneal_steps: 5000
+hcn_comp_weight: 0.1
+hcn_aux_weight: 1 # Auxiliary loss to ensure HCN embeddings are discriminative
+
+# ==============================================================================
+# TIMESTEP EMBEDDING INJECTION (Optional)
+# ==============================================================================
+
+# Enable timestep injection mode
+# When true: HCN outputs embedding added to UNet's timestep embedding
+# This is an alternative to token concatenation
+use_hcn_timestep_injection: false
+
+# Timestep embedding dimension (1280 for SD 2.1 = 4 * block_out_channels[0])
+hcn_d_time_emb: 1280
+
+# Disable FiLM mode (mutually exclusive with timestep injection)
+use_hcn_film: false
+
+# ==============================================================================
+# VALIDATION CONFIGURATION
+# ==============================================================================
+
+run_validation: true
+validation_steps: 2500
+num_validation_samples: -1
+validation_schedule_offsets:
+  - -1500
+  - 0
+val_batch_size: 16 # 16 for a100, 8 for a5000 or rtx4090
+validation_csv: null  # Optional: path to validation CSV, e.g. ./demo_chest/val_data.csv
+validation_images_dir: "./demo_chest/val_data"
+validation_sex_model_path: "./pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt"
+validation_num_images_per_prompt: 1
+validation_guidance_scale: 7.5
+validation_num_inference_steps: 75
+validation_save_images: true
+validation_metrics_batch_size: 8 # always keep at 8, regardless of gpu memory
+compute_subgroup_metrics: true
+compute_fid_radimagenet: true  # FID with RadImageNet ResNet50 (uses pretrained_models/fid_radnet if present)
+strip_demographics_in_validation: true
+test_dir: "./demo_chest/test_data"
+train_dir: "./demo_chest/training_data"
+
+
+# ==============================================================================
+# LOGGING
+# ==============================================================================
+
+logging_dir: "logs/hcn/train_hcn_age_from_promt"
+report_to: "wandb"
