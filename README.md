@@ -5,9 +5,10 @@ to generate fair, demographically-controllable synthetic medical images. It intr
 **Hierarchical Conditioner Network (HCN)** and ships alongside several baselines
 (Demographic Encoder, standard fine-tuning, FairDiffusion) for comparison.
 
+**Project site:** [mahmoudibrahim98.github.io/compdiff-site](https://mahmoudibrahim98.github.io/compdiff-site/) ·
+**Paper:** [arXiv:2603.16551](https://arxiv.org/abs/2603.16551) ·
 **Pretrained models:** [compdiff-chest-xray](https://huggingface.co/mahmoudibra98/compdiff-chest-xray) ·
-[compdiff-fundus](https://huggingface.co/mahmoudibra98/compdiff-fundus) ·
-**Paper:** [arXiv:2603.16551](https://arxiv.org/abs/2603.16551)
+[compdiff-fundus](https://huggingface.co/mahmoudibra98/compdiff-fundus)
 
 ![Generated Images](generated_images.png)
 
