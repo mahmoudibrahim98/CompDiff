@@ -1,4 +1,5 @@
 import itertools
+import os
 from typing import Iterable, Optional
 
 import torch
@@ -31,6 +32,10 @@ def load_models(args, accelerator, logger):
     if args.cache_dir is not None:
         kwargs_from_pretrained["cache_dir"] = args.cache_dir
         kwargs_from_pretrained["revision"] = args.revision
+    # Hugging Face token for gated models (e.g. stabilityai/stable-diffusion-2-1-base)
+    hf_token = getattr(args, "use_auth_token", None) or os.environ.get("HF_TOKEN")
+    if hf_token:
+        kwargs_from_pretrained["token"] = hf_token
 
     # Text encoder name to use (pretrained if specified, or default same as model name)
     text_encoder_name = (
@@ -39,14 +44,32 @@ def load_models(args, accelerator, logger):
         else args.pretrained_model_name_or_path
     )
 
-    # Model classes
-    if text_encoder_name in [
+    # Known Hub IDs for Stable Diffusion (use CLIP + subfolders text_encoder/, tokenizer/)
+    _SD_HUB_IDS = [
         "CompVis/stable-diffusion-v1-4",
         "stabilityai/stable-diffusion-2",
         "stabilityai/stable-diffusion-2-base",
         "stabilityai/stable-diffusion-2-1",
         "stabilityai/stable-diffusion-2-1-base",
-    ]:
+    ]
+    # Local folder with same layout as Hub (e.g. saved via save_sd21_cache_as_local.py)
+    _is_local_sd_path = (
+        isinstance(text_encoder_name, str)
+        and os.path.isdir(text_encoder_name)
+        and os.path.isfile(os.path.join(text_encoder_name, "text_encoder", "config.json"))
+    )
+    _use_sd_subfolders = text_encoder_name in _SD_HUB_IDS or _is_local_sd_path
+
+    # When using a local folder, load only from disk (no Hub calls)
+    _model_path = getattr(args, "pretrained_model_name_or_path", None)
+    if (
+        isinstance(_model_path, str)
+        and os.path.isdir(_model_path)
+        and os.path.isfile(os.path.join(_model_path, "text_encoder", "config.json"))
+    ):
+        kwargs_from_pretrained["local_files_only"] = True
+
+    if _use_sd_subfolders:
         text_encoder_config_class = CLIPTextConfig
         tokenizer_class = CLIPTokenizer
         text_encoder_model_class = CLIPTextModel
@@ -336,31 +359,159 @@ def load_hcn(args, logger):
         logger: Logger instance
 
     Returns:
-        hcn: HierarchicalConditioner instance or None if not enabled
+        hcn: HierarchicalConditioner or HierarchicalConditionerV8 instance or None if not enabled
     """
     if not args.use_hcn:
         logger.info("HCN disabled (use_hcn=False)")
         return None
 
-    # Check if using ordinal age loss
-    use_ordinal_age = getattr(args, 'hcn_age_loss_mode', 'ce') != 'ce'
+    # CompDiff-2: typed compositional conditioner (checked FIRST — supersedes
+    # all HCN variants when enabled)
+    if getattr(args, 'use_compdiff2', False):
+        logger.info("Loading CompDiff-2 Typed Compositional Conditioner")
+        from compdiff2 import load_compdiff2
+        return load_compdiff2(args, logger)
+
+    # Check if using V9 continuous age mode
+    use_continuous_age = getattr(args, 'use_continuous_age', False)
     
-    if use_ordinal_age:
-        logger.info("Initializing HCN with Ordinal Age Loss")
-        from hcn_v8_ordinal import HierarchicalConditionerV8Ordinal, load_hcn_v8_ordinal
-        hcn = load_hcn_v8_ordinal(args, logger)
+    if use_continuous_age:
+        # V9: Continuous age encoding
+        logger.info("Loading HCN V9 with Continuous Age Encoding")
+        try:
+            from hcn_v9_continuous_age import HierarchicalConditionerV9, load_hcn_v9
+        except ImportError:
+            raise ImportError(
+                "Could not import HCN V9 module. Make sure hcn_v9_continuous_age.py is in the same directory."
+            )
+        return load_hcn_v9(args, logger)
+        
+    # Check if we should use HCN V7 (hcn_v7.py) instead of the default (hcn.py)
+    use_hcn_v7 = getattr(args, 'use_hcn_v7', False)
+    
+    if use_hcn_v7:
+        # Check if using ordinal age loss (new V8 variant)
+        use_ordinal_age = getattr(args, 'hcn_age_loss_mode', 'ce') != 'ce'
+        
+        if use_ordinal_age:
+            logger.info("Initializing HCN V8 with Ordinal Age Loss")
+            from hcn_v8_ordinal import HierarchicalConditionerV8Ordinal, load_hcn_v8_ordinal
+            hcn = load_hcn_v8_ordinal(args, logger)
+        else:
+            logger.info("Initializing HCN V8 (standard CE)")
+            from hcn_v7 import HierarchicalConditionerV8, load_hcn_v8
+            hcn = load_hcn_v8(args, logger)
+        
         return hcn
-    
-    # Default: standard HCN with auxiliary loss on token
-    logger.info("Initializing Hierarchical Conditioner Network")
-    
+    else:
+        logger.info("Initializing Hierarchical Conditioner Network (HCN from hcn.py)")
+
     try:
-        from hcn import HierarchicalConditioner, load_hcn as load_hcn_impl
+        from hcn import HierarchicalConditioner
     except ImportError:
         raise ImportError(
             "Could not import HCN module. Make sure hcn.py is in the same directory."
         )
+
+    # Determine if auxiliary loss should be enabled based on hcn_aux_weight
+    use_aux_loss = getattr(args, 'hcn_aux_weight', 0.0) > 0.0
     
-    return load_hcn_impl(args, logger)
+    # Determine if FiLM output mode should be used (V5)
+    use_film_output = getattr(args, 'use_hcn_film', False)
+    
+    # Determine if timestep injection should be used (V6)
+    use_timestep_injection = getattr(args, 'use_hcn_timestep_injection', False)
+    d_time_emb = getattr(args, 'hcn_d_time_emb', 1280)
+    
+    hcn = HierarchicalConditioner(
+        num_age_bins=args.hcn_num_age_bins,
+        num_sex=args.hcn_num_sex,
+        num_race=args.hcn_num_race,
+        d_node=args.hcn_d_node,
+        d_ctx=args.hcn_d_ctx,
+        dropout=args.hcn_dropout,
+        use_uncertainty=args.hcn_use_uncertainty,
+        use_aux_loss=use_aux_loss,
+        use_film_output=use_film_output,
+        use_timestep_injection=use_timestep_injection,
+        d_time_emb=d_time_emb,
+    )
+
+    num_params = sum(p.numel() for p in hcn.parameters())
+    logger.info(f"HCN initialized with {num_params:,} parameters")
+    logger.info(f"  - Age bins: {args.hcn_num_age_bins}")
+    logger.info(f"  - Sex categories: {args.hcn_num_sex}")
+    logger.info(f"  - Race categories: {args.hcn_num_race}")
+    logger.info(f"  - Node dimension: {args.hcn_d_node}")
+    logger.info(f"  - Context dimension: {args.hcn_d_ctx}")
+    logger.info(f"  - Uncertainty: {args.hcn_use_uncertainty}")
+    logger.info(f"  - Auxiliary loss: {use_aux_loss} (hcn_aux_weight={getattr(args, 'hcn_aux_weight', 0.0)})")
+    logger.info(f"  - FiLM output mode (V5): {use_film_output}")
+    logger.info(f"  - Timestep injection (V6): {use_timestep_injection}")
+
+    return hcn
 
 
+##########################################################
+def load_film_components(args, unet, logger):
+    """
+    Load FiLM adapter and create wrapped UNet if FiLM mode is enabled.
+    
+    Args:
+        args: Config arguments
+        unet: The base UNet model
+        logger: Logger instance
+        
+    Returns:
+        Tuple of (film_adapter, wrapped_unet) or (None, unet) if FiLM disabled
+    """
+    if not getattr(args, 'use_hcn_film', False):
+        logger.info("FiLM conditioning disabled (use_hcn_film=False)")
+        return None, unet
+    
+    try:
+        from film import FiLMAdapter, FiLMUNetWrapper, get_unet_block_channels
+    except ImportError:
+        raise ImportError(
+            "Could not import FiLM module. Make sure film.py is in the same directory."
+        )
+    
+    logger.info("=" * 60)
+    logger.info("Initializing FiLM Conditioning (V5)")
+    logger.info("=" * 60)
+    
+    # Get UNet block channels
+    block_channels = get_unet_block_channels(unet)
+    logger.info(f"  UNet has {len(block_channels)} ResNet blocks")
+    logger.info(f"  Block channels: {block_channels[:5]}... (showing first 5)")
+    
+    # Create FiLM adapter
+    d_input = getattr(args, 'hcn_d_node', 256)
+    d_hidden = getattr(args, 'film_d_hidden', 512)
+    
+    film_adapter = FiLMAdapter(
+        d_input=d_input,
+        block_channels=block_channels,
+        d_hidden=d_hidden,
+    )
+    
+    # Count parameters
+    num_params = sum(p.numel() for p in film_adapter.parameters())
+    logger.info(f"  FiLM adapter parameters: {num_params:,}")
+    
+    # Create wrapped UNet
+    film_scale = getattr(args, 'film_scale', 1.0)
+    film_blocks = getattr(args, 'film_blocks', 'all')
+    
+    wrapped_unet = FiLMUNetWrapper(
+        unet=unet,
+        film_adapter=film_adapter,
+        film_scale=film_scale,
+        film_blocks=film_blocks,
+    )
+    
+    logger.info(f"  FiLM scale: {film_scale}")
+    logger.info(f"  FiLM blocks: {film_blocks}")
+    logger.info("=" * 60)
+    
+    return film_adapter, wrapped_unet

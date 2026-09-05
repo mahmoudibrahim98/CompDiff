@@ -6,7 +6,7 @@ This script monitors the output directory for new checkpoints and automatically
 runs validation on them. It can be run in parallel with training.
 
 Usage:
-    accelerate launch gen_source/run_validation_monitor.py --config_file configs/your_config.yaml
+    accelerate launch roentgenv2/train_code/run_validation_monitor.py --config_file configs/your_config.yaml
 """
 
 import os
@@ -567,15 +567,49 @@ class ValidationRunner:
             # Initialize HCN on all ranks - if it fails on any rank, we need to know
             # All ranks must execute this code path (no is_main_process check)
             try:
-                # Check if using ordinal age loss
-                elif self.args.get("hcn_age_loss_mode", "ce") != "ce":
-                    from hcn_v8_ordinal import HierarchicalConditionerV8Ordinal
-                    # Determine if auxiliary loss should be enabled based on hcn_aux_weight
+                # Check if using V9 continuous age mode (must check FIRST, before use_hcn_v7)
+                # This must match the training code logic in models.py:load_hcn()
+                use_continuous_age = self.args.get("use_continuous_age", False)
+
+                if self.args.get("use_compdiff2", False):
+                    # CompDiff-2: typed compositional conditioner
+                    # (checked FIRST — must match models.py:load_hcn dispatch order)
+                    from compdiff2 import CompDiff2Conditioner
+                    hcn_aux_weight = self.args.get("hcn_aux_weight", 0.0)
+                    self.hcn = CompDiff2Conditioner(
+                        num_sex=self.args.get("hcn_num_sex", 2),
+                        num_race=self.args.get("hcn_num_race", 4),
+                        num_age_bins=self.args.get("hcn_num_age_bins", 5),
+                        d_node=self.args.get("hcn_d_node", 256),
+                        d_ctx=self.args.get("hcn_d_ctx", 1024),
+                        d_time_emb=self.args.get("hcn_d_time_emb", 1280),
+                        max_age=self.args.get("max_age", 100),
+                        age_freq_dim=self.args.get("cd2_age_freq_dim", 128),
+                        composer=self.args.get("cd2_composer", "hierarchical"),
+                        multi_token=self.args.get("cd2_multi_token", False),
+                        route_b=self.args.get("cd2_route_b", False),
+                        num_registers=self.args.get("cd2_num_registers", 0),
+                        attr_dropout_prob=self.args.get("cd2_attr_dropout_prob", 0.0),
+                        full_dropout_prob=self.args.get("cd2_full_dropout_prob", 0.0),
+                        use_uncertainty=self.args.get("hcn_use_uncertainty", True),
+                        use_aux_loss=hcn_aux_weight > 0.0,
+                        aux_hidden_dim=self.args.get("hcn_aux_hidden_dim", 512),
+                        dropout=self.args.get("hcn_dropout", 0.1),
+                        transformer_layers=self.args.get("cd2_transformer_layers", 2),
+                        transformer_heads=self.args.get("cd2_transformer_heads", 4),
+                    )
+                    if self.accelerator.is_local_main_process:
+                        logger.info(
+                            f"✓ CompDiff-2 conditioner initialized on all ranks "
+                            f"(composer={self.hcn.composer_type}, tokens={self.hcn.num_output_tokens}, "
+                            f"route_b={self.hcn.route_b})"
+                        )
+                elif use_continuous_age:
+                    # V9: Continuous age encoding
+                    from hcn_v9_continuous_age import HierarchicalConditionerV9
                     hcn_aux_weight = self.args.get("hcn_aux_weight", 0.0)
                     use_aux_loss = hcn_aux_weight > 0.0
-                    age_loss_mode = self.args.get("hcn_age_loss_mode", "ordinal")
-                    soft_ce_sigma = self.args.get("hcn_soft_ce_sigma", 0.75)
-                    self.hcn = HierarchicalConditionerV8Ordinal(
+                    self.hcn = HierarchicalConditionerV9(
                         num_age_bins=self.args.get("hcn_num_age_bins", 5),
                         num_sex=self.args.get("hcn_num_sex", 2),
                         num_race=self.args.get("hcn_num_race", 4),
@@ -585,25 +619,61 @@ class ValidationRunner:
                         use_uncertainty=self.args.get("hcn_use_uncertainty", True),
                         use_aux_loss=use_aux_loss,
                         aux_hidden_dim=self.args.get("hcn_aux_hidden_dim", 512),
-                        age_loss_mode=age_loss_mode,
-                        soft_ce_sigma=soft_ce_sigma,
+                        use_continuous_age=use_continuous_age,
+                        max_age=self.args.get("max_age", 100.0),
                     )
                     if self.accelerator.is_local_main_process:
-                        logger.info(f"✓ HCN with Ordinal Age Loss initialized on all ranks (mode: {age_loss_mode})")
-                else:
-                    # Default: standard HCN - use the load_hcn function from models
-                    from models import load_hcn
-                    # Create a minimal args object for load_hcn
-                    class Args:
-                        pass
-                    args = Args()
-                    for key, val in self.args.items():
-                        setattr(args, key, val)
-                    # Ensure use_hcn is set
-                    args.use_hcn = True
-                    self.hcn = load_hcn(args, logger)
-                    if self.accelerator.is_local_main_process:
-                        logger.info(f"✓ HCN architecture initialized on all ranks")
+                        logger.info(f"✓ HCN V9 with Continuous Age Encoding initialized on all ranks")
+                # Check if we should use HCN V7 (hcn_v7.py) instead of the default (hcn.py)
+                elif self.args.get("use_hcn_v7", False):
+                    use_hcn_v7 = True
+                    # Check if using ordinal age loss (new V8 variant)
+                    # This must match the training code logic in models.py:load_hcn()
+                    use_ordinal_age = self.args.get("hcn_age_loss_mode", "ce") != "ce"
+                    
+                    if use_ordinal_age:
+                        from hcn_v8_ordinal import HierarchicalConditionerV8Ordinal
+                        # Determine if auxiliary loss should be enabled based on hcn_aux_weight
+                        hcn_aux_weight = self.args.get("hcn_aux_weight", 0.0)
+                        use_aux_loss = hcn_aux_weight > 0.0
+                        age_loss_mode = self.args.get("hcn_age_loss_mode", "ordinal")
+                        soft_ce_sigma = self.args.get("hcn_soft_ce_sigma", 0.75)
+                        self.hcn = HierarchicalConditionerV8Ordinal(
+                            num_age_bins=self.args.get("hcn_num_age_bins", 5),
+                            num_sex=self.args.get("hcn_num_sex", 2),
+                            num_race=self.args.get("hcn_num_race", 4),
+                            d_node=self.args.get("hcn_d_node", 256),
+                            d_ctx=self.args.get("hcn_d_ctx", 1024),
+                            dropout=self.args.get("hcn_dropout", 0.1),
+                            use_uncertainty=self.args.get("hcn_use_uncertainty", True),
+                            use_aux_loss=use_aux_loss,
+                            aux_hidden_dim=self.args.get("hcn_aux_hidden_dim", 512),
+                            age_loss_mode=age_loss_mode,
+                            soft_ce_sigma=soft_ce_sigma,
+                        )
+                        if self.accelerator.is_local_main_process:
+                            logger.info(f"✓ HCN V8 with Ordinal Age Loss initialized on all ranks (mode: {age_loss_mode})")
+                    else:
+                        from hcn_v7 import HierarchicalConditionerV8
+                        # Determine if auxiliary loss should be enabled based on hcn_aux_weight
+                        hcn_aux_weight = self.args.get("hcn_aux_weight", 0.0)
+                        use_aux_loss = hcn_aux_weight > 0.0
+                        self.hcn = HierarchicalConditionerV8(
+                            num_age_bins=self.args.get("hcn_num_age_bins", 5),
+                            num_sex=self.args.get("hcn_num_sex", 2),
+                            num_race=self.args.get("hcn_num_race", 4),
+                            d_node=self.args.get("hcn_d_node", 256),
+                            d_ctx=self.args.get("hcn_d_ctx", 1024),
+                            dropout=self.args.get("hcn_dropout", 0.1),
+                            use_uncertainty=self.args.get("hcn_use_uncertainty", True),
+                            use_aux_loss=use_aux_loss,
+                            aux_hidden_dim=self.args.get("hcn_aux_hidden_dim", 512),
+                            encode_age=self.args.get("hcn_encode_age", True),
+                        )
+                        if self.accelerator.is_local_main_process:
+                            logger.info(f"✓ HCN V8 architecture initialized on all ranks")
+                elif not use_continuous_age:
+                    from hcn import HierarchicalConditioner
                     # Determine if auxiliary loss should be enabled based on hcn_aux_weight
                     # This must match the training code logic in models.py:load_hcn()
                     hcn_aux_weight = self.args.get("hcn_aux_weight", 0.0)
@@ -849,6 +919,7 @@ class ValidationRunner:
             "race": [],
             "age": [],
             "prompts": [],
+            "keys": [],
         }
 
         num_images_per_prompt = self.args.get("validation_num_images_per_prompt", 4)
@@ -874,13 +945,41 @@ class ValidationRunner:
 
             for i in range(samples_to_take):
                 prompt = batch.get("text", [""])[i] if isinstance(batch.get("text"), list) else batch.get("text", "")
+                sk = batch.get("sample_key")
+                sample_key = sk[i] if isinstance(sk, (list, tuple)) else None
                 all_prompts_data.append({
                     "prompt": prompt,
+                    "key": sample_key,
                     "batch": batch,
                     "batch_idx": i,
                 })
 
             num_prompts_collected += samples_to_take
+
+        only_heldout = self.args.get("only_heldout_cells")
+        if only_heldout:
+            from dataset_wds import parse_age_bin, parse_sex, parse_race, get_default_age_bins
+            target_cells = set()
+            for spec in only_heldout.split(","):
+                parts = [p.strip().lower() for p in spec.split("|")]
+                if len(parts) == 3:
+                    target_cells.add(tuple(parts))
+            age_bins = get_default_age_bins()
+            age_labels = [f"0-{age_bins[0]}"] + [f"{age_bins[i-1]}-{age_bins[i]}" for i in range(1, len(age_bins))] + [f"{age_bins[-1]}+"]
+            sex_labels = ["male", "female"]
+            race_labels = ["white", "black", "asian", "hispanic"]
+            filtered = []
+            for p in all_prompts_data:
+                bt = p["batch"].get("text", "")
+                text = bt[p["batch_idx"]] if isinstance(bt, list) else bt
+                age_str = age_labels[parse_age_bin(text)].lower()
+                sex_str = sex_labels[parse_sex(text)]
+                race_str = race_labels[parse_race(text)]
+                if (age_str, sex_str, race_str) in target_cells:
+                    filtered.append(p)
+            if self.accelerator.is_local_main_process:
+                logger.info(f"Held-out cell filter: {len(all_prompts_data)} -> {len(filtered)} prompts across {len(target_cells)} target cells")
+            all_prompts_data = filtered
 
         if self.accelerator.is_local_main_process:
             if use_all_samples:
@@ -892,9 +991,53 @@ class ValidationRunner:
             logger.info(f"  - {num_images_per_prompt} image(s) per prompt")
             logger.info(f"  - Distributed across {self.accelerator.num_processes} GPU(s)")
 
-        # Distribute prompts across GPUs
+        # ------------------------------------------------------------------
+        # Deterministic evaluation order (COVERAGE FIX, 2026-08-15):
+        # the wds shuffle is pid+clock seeded, so each rank (or each
+        # independent gen job) enumerates the stream in a DIFFERENT order.
+        # Striding a rank-local order with i%N yields ~1-((N-1)/N)^N unique
+        # coverage with duplicates (measured: v7-SplitA test 72.6% instance
+        # coverage, 22.5% of prompts never generated). Sorting by sample key
+        # gives every rank the same order, so the stride is a true partition:
+        # 100% coverage, zero duplication.
+        # ------------------------------------------------------------------
+        if self.args.get("deterministic_eval_order", False):
+            n_keyed = sum(1 for p in all_prompts_data if p.get("key"))
+            if n_keyed != len(all_prompts_data):
+                raise RuntimeError(
+                    f"deterministic_eval_order requires sample keys on every prompt "
+                    f"({n_keyed}/{len(all_prompts_data)} have keys). The validation "
+                    f"dataset must provide 'sample_key' (dataset_wds include_text path)."
+                )
+            all_prompts_data.sort(key=lambda p: p["key"])
+            if self.accelerator.is_local_main_process:
+                logger.info(f"Deterministic evaluation order: sorted {len(all_prompts_data)} prompts by sample key")
+
+        # Distribute prompts across GPUs.
+        # gen_shard mode ("K:N"): this single-GPU job stands in for rank K of
+        # an N-way run — same stride, same seed formula, same gpu_K output dir.
         num_gpus = self.accelerator.num_processes
         gpu_idx = self.accelerator.process_index
+        gen_shard = self.args.get("gen_shard")
+        if gen_shard:
+            gpu_idx, num_gpus = (int(x) for x in str(gen_shard).split(":"))
+            if not self.args.get("deterministic_eval_order", False):
+                if not self.args.get("legacy_coverage", False):
+                    raise RuntimeError(
+                        "gen_shard requires deterministic_eval_order (rank-local orders do not "
+                        "partition). To deliberately REPRODUCE the legacy ~66%-coverage multiset "
+                        "sampling (independent per-shard order + stride), pass --legacy_coverage."
+                    )
+                logger.warning(
+                    f"legacy_coverage: shard {gpu_idx}/{num_gpus} strides its OWN shuffled order — "
+                    f"expected unique coverage ~{1-((num_gpus-1)/num_gpus)**num_gpus:.1%} with duplicates "
+                    f"(faithful to the pre-fix sampling structure; NOT a full partition)"
+                )
+            if self.accelerator.num_processes != 1:
+                raise RuntimeError("gen_shard is a single-process mode (launch with --num_processes=1)")
+            logger.info(f"gen_shard mode: standing in for rank {gpu_idx} of {num_gpus}")
+        # Effective rank used by the seed formula and output dir naming
+        self._effective_rank = gpu_idx
 
         prompts_for_this_gpu = []
         for i, prompt_idx in enumerate(range(len(all_prompts_data))):
@@ -931,7 +1074,7 @@ class ValidationRunner:
                 all_synthetic_images.extend(synthetic_batch)
                 all_real_images.extend(real_batch)
                 for key in labels_batch:
-                    all_labels[key].extend(labels_batch[key])
+                    all_labels.setdefault(key, []).extend(labels_batch[key])
 
                 progress_bar.update(len(batch_images))
 
@@ -1015,19 +1158,14 @@ class ValidationRunner:
         # Ensure unconditional embeddings match the sequence length of conditional ones.
         # We intentionally DO NOT add demographic conditioning here; instead we append zero
         # demographic tokens so classifier-free guidance still works mathematically.
-        # Note: For V6 timestep injection mode, we don't concatenate tokens, so skip this.
-        if self.hcn is not None and hcn_time_emb is None:
-            # V1 token mode: add zero token to match conditional sequence length
+        # Padding count is derived from the actual conditional sequence length, which
+        # covers every mode uniformly: V1 token (1), CompDiff-2 multi-token (T),
+        # DemographicEncoder (N), V6 timestep injection (0 — nothing concatenated),
+        # and CompDiff-2 dual-route (T tokens + time_emb handled in the loop).
+        num_extra = text_embeddings.shape[1] - uncond_embeddings.shape[1]
+        if num_extra > 0:
             zero_ctx = torch.zeros(
-                (uncond_embeddings.shape[0], 1, uncond_embeddings.shape[-1]),
-                device=uncond_embeddings.device,
-                dtype=uncond_embeddings.dtype,
-            )
-            uncond_embeddings = torch.cat([uncond_embeddings, zero_ctx], dim=1)
-        
-        if self.demographic_encoder is not None:
-            zero_ctx = torch.zeros(
-                (uncond_embeddings.shape[0], 1, uncond_embeddings.shape[-1]),
+                (uncond_embeddings.shape[0], num_extra, uncond_embeddings.shape[-1]),
                 device=uncond_embeddings.device,
                 dtype=uncond_embeddings.dtype,
             )
@@ -1046,9 +1184,12 @@ class ValidationRunner:
 
         # Generate latents with unique seeds (validation_seed allows different runs via --seed)
         base_seed = self.args.get("validation_seed", 0)
+        # _effective_rank == process_index normally; in gen_shard mode it is
+        # the impersonated rank K so seeds match the original N-way formula.
+        _rank = getattr(self, "_effective_rank", self.accelerator.process_index)
         generators = [
             torch.Generator(device=self.accelerator.device).manual_seed(
-                base_seed + global_step * 10000 + self.accelerator.process_index * 1000 + batch_start_idx + i
+                base_seed + global_step * 10000 + _rank * 1000 + batch_start_idx + i
             )
             for i in range(local_batch_size)
         ]
@@ -1080,7 +1221,7 @@ class ValidationRunner:
                 # For classifier-free guidance, we need to handle both unconditional and conditional
                 # Unconditional: use zero time_emb, Conditional: use actual time_emb
                 zero_time_emb = torch.zeros_like(hcn_time_emb)
-                combined_time_emb = torch.cat([zero_time_emb, hcn_time_emb], dim=0)
+                combined_time_emb = torch.cat([zero_time_emb, hcn_time_emb], dim=0).to(dtype=text_embeddings.dtype)
                 
                 from train_loop import TimestepInjectionContext
                 with TimestepInjectionContext(unet, combined_time_emb):
@@ -1120,10 +1261,13 @@ class ValidationRunner:
             "race": [],
             "age": [],
             "prompts": prompts,
+            "keys": [],
         }
 
         for i in range(local_batch_size):
             batch, batch_idx = batch_data_list[i]
+            sk = batch.get("sample_key")
+            labels["keys"].append(sk[batch_idx] if isinstance(sk, (list, tuple)) else None)
             if "disease_labels" in batch:
                 labels["disease"].append(batch["disease_labels"][batch_idx].cpu())
             if "sex_idx" in batch:
@@ -1140,22 +1284,37 @@ class ValidationRunner:
         if self.hcn is None:
             return text_embeddings
 
+        # Check if using V9 (continuous age) - check both config and HCN type
+        use_continuous_age = self.args.get("use_continuous_age", False)
+        is_v9 = hasattr(self.hcn, 'use_continuous_age') and getattr(self.hcn, 'use_continuous_age', False)
+        use_continuous_age = use_continuous_age or is_v9
+        # CompDiff-2 uses continuous age inside the typed composer
+        is_cd2 = self.args.get("use_compdiff2", False)
+
         age_indices = []
+        age_continuous_values = []
         sex_indices = []
         race_indices = []
 
         for (batch_data, batch_idx) in batch_data_list:
             has_demographics = "sex_idx" in batch_data and "race_idx" in batch_data
-            has_age = "age_idx" in batch_data
-            
+            has_age = "age_idx" in batch_data or "age_continuous" in batch_data
+
             if has_demographics and has_age:
                 sex_idx = batch_data["sex_idx"][batch_idx] if batch_data["sex_idx"].dim() > 0 else batch_data["sex_idx"]
                 race_idx = batch_data["race_idx"][batch_idx] if batch_data["race_idx"].dim() > 0 else batch_data["race_idx"]
-                
+
                 sex_indices.append(sex_idx)
                 race_indices.append(race_idx)
-                
-                if "age_idx" in batch_data:
+
+                if (use_continuous_age or is_cd2) and "age_continuous" in batch_data:
+                    age_cont = batch_data["age_continuous"][batch_idx] if batch_data["age_continuous"].dim() > 0 else batch_data["age_continuous"]
+                    age_continuous_values.append(age_cont)
+                elif is_cd2 and "age" in batch_data:
+                    # Fallback: raw age in years from validation metadata
+                    age_cont = batch_data["age"][batch_idx] if batch_data["age"].dim() > 0 else batch_data["age"]
+                    age_continuous_values.append(age_cont.float())
+                elif "age_idx" in batch_data:
                     age_idx = batch_data["age_idx"][batch_idx] if batch_data["age_idx"].dim() > 0 else batch_data["age_idx"]
                     age_indices.append(age_idx)
 
@@ -1172,8 +1331,34 @@ class ValidationRunner:
             hcn_unwrapped.eval()
             
             # HCN returns 5 values: ctx, mu, logsigma, aux_logits, time_emb
-            # Call with appropriate arguments
-            if age_indices:
+            # Call with appropriate arguments based on HCN version
+            if is_cd2:
+                # CompDiff-2: continuous age into the typed composer.
+                # Returns T>=1 tokens (concatenated below) AND, when Route B is
+                # enabled, a timestep-modulation vector (returned as time_emb;
+                # the diffusion loop injects it with zeros for the uncond half).
+                if age_continuous_values:
+                    age_continuous_tensor = torch.stack(age_continuous_values).squeeze().to(self.accelerator.device)
+                    if age_continuous_tensor.dim() == 0:
+                        age_continuous_tensor = age_continuous_tensor.unsqueeze(0)
+                else:
+                    age_continuous_tensor = None  # partial conditioning (age unspecified)
+                hcn_ctx, _, _, _, time_emb = hcn_unwrapped(
+                    sex_idx=sex_indices,
+                    race_idx=race_indices,
+                    age_continuous=age_continuous_tensor,
+                )
+            elif use_continuous_age and age_continuous_values:
+                # V9: Use keyword arguments with age_continuous
+                age_continuous_tensor = torch.stack(age_continuous_values).squeeze().to(self.accelerator.device)
+                if age_continuous_tensor.dim() == 0:
+                    age_continuous_tensor = age_continuous_tensor.unsqueeze(0)
+                hcn_ctx, _, _, _, time_emb = hcn_unwrapped(
+                    sex_idx=sex_indices,
+                    race_idx=race_indices,
+                    age_continuous=age_continuous_tensor,
+                )
+            elif age_indices:
                 # V7/V8: Check if V8 Ordinal (uses positional args) or V7/V8 (uses keyword args)
                 age_indices = torch.stack(age_indices).squeeze().to(self.accelerator.device)
                 if age_indices.dim() == 0:
@@ -1260,7 +1445,13 @@ class ValidationRunner:
     def _load_validation_images_from_disk(self, global_step):
         """Load all validation images from disk (saved by all GPUs)."""
         # Use test_images directory in test mode, train_images in train mode, GT_images in GT mode, validation_images otherwise
+        # Multi-seed mode interposes a seed_<S> subdirectory between step_<N> and gpu_<G>
         output_dir = Path(self.args["output_dir"])
+        if self.args.get("test_seeds_mode", False):
+            images_dir_name = "test_images_seeds"
+            seed_val = self.args.get("validation_seed", 0)
+            validation_images_dir = output_dir / images_dir_name / f"step_{global_step}" / f"seed_{seed_val}"
+            return self._load_validation_images_from_custom_dir(validation_images_dir)
         if self.args.get("test_mode", False):
             images_dir_name = "test_images"
         elif self.args.get("train_mode", False):
@@ -1465,20 +1656,27 @@ class ValidationRunner:
             
             # Create output directory for validation images
             # Use test_images directory in test mode, train_images in train mode, GT_images in GT mode, validation_images otherwise
+            # Multi-seed mode interposes a seed_<S> subdirectory between step_<N> and gpu_<G>
             output_dir = Path(self.args["output_dir"])
-            if self.args.get("test_mode", False):
-                images_dir_name = "test_images"
-            elif self.args.get("train_mode", False):
-                images_dir_name = "train_images"
-            elif self.args.get("gt_mode", False):
-                images_dir_name = "GT_images"
+            if self.args.get("test_seeds_mode", False):
+                images_dir_name = "test_images_seeds"
+                seed_val = self.args.get("validation_seed", 0)
+                validation_images_dir = output_dir / images_dir_name / f"step_{global_step}" / f"seed_{seed_val}"
             else:
-                images_dir_name = "validation_images"
-            validation_images_dir = output_dir / images_dir_name / f"step_{global_step}"
+                if self.args.get("test_mode", False):
+                    images_dir_name = "test_images"
+                elif self.args.get("train_mode", False):
+                    images_dir_name = "train_images"
+                elif self.args.get("gt_mode", False):
+                    images_dir_name = "GT_images"
+                else:
+                    images_dir_name = "validation_images"
+                validation_images_dir = output_dir / images_dir_name / f"step_{global_step}"
             validation_images_dir.mkdir(parents=True, exist_ok=True)
             
-            # Save images from this GPU
-            gpu_idx = self.accelerator.process_index
+            # Save images from this GPU (effective rank == impersonated rank K
+            # in gen_shard mode, so shard jobs write the same gpu_K layout)
+            gpu_idx = getattr(self, "_effective_rank", self.accelerator.process_index)
             gpu_dir = validation_images_dir / f"gpu_{gpu_idx}"
             gpu_dir.mkdir(parents=True, exist_ok=True)
             
@@ -1491,6 +1689,7 @@ class ValidationRunner:
                 "race": all_labels.get("race", []),
                 "age": all_labels.get("age", []),
                 "prompts": prompts,
+                "keys": all_labels.get("keys", []),
             }
             
             for i, (synth_img, real_img) in enumerate(zip(all_synthetic_images, all_real_images)):
@@ -1503,10 +1702,15 @@ class ValidationRunner:
                     real_path = gpu_dir / f"real_{i:06d}.png"
                     save_image(real_img, real_path)
                 
-                # Save prompt if available
+                # Save prompt if available. Explicit UTF-8: prompts contain
+                # non-ASCII (e.g. "↑"); on nodes where C-locale coercion does
+                # not engage, the default codec is ASCII and this write raised
+                # UnicodeEncodeError — swallowed as a warning, the rank saved a
+                # fraction of its images and rank 0 waited out the full barrier
+                # timeout (Snellius §2.2).
                 if i < len(prompts) and prompts[i]:
                     prompt_path = gpu_dir / f"prompt_{i:06d}.txt"
-                    with open(prompt_path, 'w') as f:
+                    with open(prompt_path, 'w', encoding='utf-8', errors='replace') as f:
                         f.write(str(prompts[i]))
             
             # Save labels as pickle file
@@ -2414,23 +2618,39 @@ class ValidationRunner:
                 
                 logger.info(f"[Rank {self.accelerator.process_index}] Saved images to disk")
 
+            # gen_only (sharded test DAG): this job's contract ends at a saved,
+            # done-marked gpu_K directory. Metrics are computed by a separate
+            # afterok-gated job, so scoring a partial set is structurally
+            # impossible — no barrier wait, no manifest write here.
+            if self.args.get("gen_only", False):
+                logger.info(f"[gen_only] shard complete; skipping barrier and metrics")
+                return None
+
             # ==============================================================
             # PHASE 2.5: VERIFY ALL GPUS COMPLETED (rank 0 checks)
             # ==============================================================
             if self.accelerator.is_main_process:
                 # Wait for all GPUs to finish saving by checking for "done" markers
                 import time
-                if self.args.get("test_mode", False):
-                    images_dir_name = "test_images"
-                elif self.args.get("train_mode", False):
-                    images_dir_name = "train_images"
-                elif self.args.get("gt_mode", False):
-                    images_dir_name = "GT_images"
+                if self.args.get("test_seeds_mode", False):
+                    images_dir_name = "test_images_seeds"
+                    seed_val = self.args.get("validation_seed", 0)
+                    validation_images_dir = Path(self.args["output_dir"]) / images_dir_name / f"step_{global_step}" / f"seed_{seed_val}"
                 else:
-                    images_dir_name = "validation_images"
-                validation_images_dir = Path(self.args["output_dir"]) / images_dir_name / f"step_{global_step}"
+                    if self.args.get("test_mode", False):
+                        images_dir_name = "test_images"
+                    elif self.args.get("train_mode", False):
+                        images_dir_name = "train_images"
+                    elif self.args.get("gt_mode", False):
+                        images_dir_name = "GT_images"
+                    else:
+                        images_dir_name = "validation_images"
+                    validation_images_dir = Path(self.args["output_dir"]) / images_dir_name / f"step_{global_step}"
                 expected_gpu_dirs = [validation_images_dir / f"gpu_{i}" for i in range(self.accelerator.num_processes)]
-                max_wait_seconds = 600
+                # Configurable; on expiry we RAISE instead of scoring partial
+                # image sets (Snellius §2.1: 1800s + proceed-on-timeout silently
+                # produced FID overstated by 4-12 points on 4 of 9 checkpoints).
+                max_wait_seconds = int(self.args.get("validation_generation_timeout", 1800))
                 poll_interval = 5
                 waited = 0
 
@@ -2455,10 +2675,16 @@ class ValidationRunner:
                     waited += poll_interval
 
                 if waited >= max_wait_seconds:
-                    logger.warning(
-                        f"Timeout waiting for all GPUs to finish saving images for step {global_step}. "
-                        f"Proceeding with whatever images are present; metrics may use fewer than the "
-                        f"expected {self.accelerator.num_processes} * images_per_gpu."
+                    # RAISE, never score a partial image set as 'completed'.
+                    # The lagging ranks usually do finish after rank 0 gives up,
+                    # so the checkpoint can be re-scored cheaply later with
+                    # --load_images_from_dir once all images are on disk.
+                    missing = [f"gpu_{i}" for i, d in enumerate(expected_gpu_dirs) if not (d / "done.txt").exists()]
+                    raise RuntimeError(
+                        f"Timeout ({max_wait_seconds}s) waiting for image generation at step {global_step}; "
+                        f"missing done markers: {missing}. Refusing to compute metrics on a partial image set "
+                        f"(would silently overstate FID). Raise validation_generation_timeout in the config, "
+                        f"or re-score later with --load_images_from_dir."
                     )
 
             # ==============================================================
@@ -2562,8 +2788,14 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Random seed for validation image generation. Different seeds produce different samples; same seed gives reproducible runs. Can also be set in config as validation_seed.")
     # Test mode arguments
     parser.add_argument("--test_mode", action="store_true", help="Run in test mode: validate specific checkpoints")
+    parser.add_argument("--deterministic_eval_order", action="store_true", help="Sort prompts by sample key before the i%%N stride so all ranks/jobs share one order (100%% coverage; fixes pid-seeded-shuffle divergence)")
+    parser.add_argument("--gen_shard", type=str, default=None, help="'K:N' — single-GPU job impersonates rank K of an N-way run (implies deterministic order; use with --gen_only)")
+    parser.add_argument("--gen_only", action="store_true", help="Generate and save images only; skip barrier, metrics and manifest (metrics run as a separate afterok job)")
+    parser.add_argument("--legacy_coverage", action="store_true", help="With --gen_shard: deliberately reproduce the pre-fix sampling structure (independent per-shard shuffle order + stride => ~66%% unique multiset). For bias-quantification experiments only.")
     parser.add_argument("--checkpoints", type=str, default=None, help="Comma-separated list of checkpoint numbers to validate in test mode (e.g., '30000,50000,70000')")
     parser.add_argument("--test_continuous", action="store_true", help="In test mode: continuously monitor for checkpoints matching the specified list. If not set, only processes existing checkpoints once.")
+    parser.add_argument("--test_seeds", type=str, default=None, help="In test mode: comma-separated list of generation seeds (e.g., '123,456'). For each checkpoint, the test set is regenerated once per seed under test_images_seeds/step_<N>/seed_<S>/gpu_<G>/, with manifest test_manifest_seeds.json and sync dir test_sync_seeds. Requires --test_mode.")
+    parser.add_argument("--only_heldout_cells", type=str, default=None, help="Comma-separated list of demographic cells to keep (skip all others). Each cell is '<age_group>|<sex>|<race>'; comparison is case-insensitive. Example: '40-60|Female|Asian,60-80|Male|Hispanic'. Applied after prompt collection, before per-GPU dispatch.")
     # Train mode arguments
     parser.add_argument("--train_mode", action="store_true", help="Run in train mode: validate specific checkpoints on train dataset")
     parser.add_argument("--train_continuous", action="store_true", help="In train mode: continuously monitor for checkpoints matching the specified list. If not set, only processes existing checkpoints once.")
@@ -2576,6 +2808,9 @@ def main():
     config = load_config(args.config_file)
     if config is None:
         raise ValueError(f"Failed to load config from {args.config_file}")
+
+    if args.only_heldout_cells:
+        config["only_heldout_cells"] = args.only_heldout_cells
     
     # Determine if we're in test mode, train mode, or GT mode (mutually exclusive)
     test_mode = args.test_mode
@@ -2595,12 +2830,24 @@ def main():
                 raise ValueError("No valid checkpoint numbers provided")
         except ValueError as e:
             raise ValueError(f"Invalid checkpoint numbers format: {args.checkpoints}. Expected comma-separated integers. Error: {e}")
-        
+
+        # Optional multi-seed regeneration: per-checkpoint, regenerate the test set once per seed
+        test_seeds_list = None
+        if args.test_seeds is not None:
+            try:
+                test_seeds_list = [int(s.strip()) for s in args.test_seeds.split(",") if s.strip()]
+                if not test_seeds_list:
+                    raise ValueError("No valid seeds provided")
+            except ValueError as e:
+                raise ValueError(f"Invalid --test_seeds format: {args.test_seeds}. Expected comma-separated integers. Error: {e}")
+            config["test_seeds_mode"] = True
+            config["test_seeds_list"] = test_seeds_list
+
         # Extract test_dir from config file (where test images are located, equivalent to validation_images_dir)
         test_dir = config.get("test_dir")
         if test_dir is None:
             raise ValueError("test_dir must be specified in config file when using --test_mode")
-        
+
         # Override validation_images_dir with test_dir for test mode
         # This makes test_dir work like validation_images_dir - pointing to the test dataset directory
         config["validation_images_dir"] = test_dir
@@ -2608,18 +2855,20 @@ def main():
         # This is critical because when use_wds_dataset=True, validation_csv is checked first (line 469)
         # We always override it in test mode to ensure we use the test dataset, not validation
         config["validation_csv"] = test_dir
-        
+
         # Mark that we're in test mode (for saving images to test_images directory)
         config["test_mode"] = True
-        
+
         print(f"Test mode: Using test directory from config: {test_dir}")
         print(f"Test mode: Overriding validation_images_dir to: {test_dir}")
-        
-        # Override manifest file to test_manifest.json
+
+        # Override manifest file: test_manifest_seeds.json for multi-seed runs, test_manifest.json otherwise
         if args.manifest_file == "validation_manifest.json":  # Only override if using default
-            args.manifest_file = "test_manifest.json"
-        
+            args.manifest_file = "test_manifest_seeds.json" if test_seeds_list is not None else "test_manifest.json"
+
         print(f"Test mode: Will validate checkpoints: {checkpoint_numbers}")
+        if test_seeds_list is not None:
+            print(f"Test mode: Multi-seed regeneration enabled, seeds: {test_seeds_list}")
         print(f"Test mode: Using manifest file: {args.manifest_file}")
     
     if train_mode:
@@ -2703,6 +2952,28 @@ def main():
         config["load_images_from_dir"] = True
         # Use print before Accelerator is initialized (logger requires Accelerator)
         print(f"Image loading mode: Will monitor and load pre-generated images from validation_images directory")
+
+    # Sharded test DAG flags (collect -> gen_0..gen_{N-1} -> metrics)
+    if args.deterministic_eval_order:
+        config["deterministic_eval_order"] = True
+        print("Deterministic evaluation order: ON (key-sorted; full-coverage partition)")
+    if args.gen_shard:
+        config["gen_shard"] = args.gen_shard
+        config["deterministic_eval_order"] = True  # implied
+        print(f"gen_shard mode: {args.gen_shard}")
+    if args.gen_only:
+        config["gen_only"] = True
+        print("gen_only mode: generation + save only; metrics deferred to afterok job")
+        # Redirect manifest writes to a per-shard scratch file: a gen job that
+        # marks the checkpoint in the REAL manifest makes the metrics job skip
+        # it as "already validated" (observed: DAG job 122812, empty completed
+        # row with num_images=0 from racing gen jobs).
+        _shard_tag = str(args.gen_shard).replace(":", "of") if args.gen_shard else "solo"
+        args.manifest_file = f"gen_scratch_{_shard_tag}_{args.manifest_file}"
+        print(f"gen_only: manifest redirected to scratch file {args.manifest_file}")
+    if args.legacy_coverage:
+        config["legacy_coverage"] = True
+        print("legacy_coverage mode: REPRODUCING the pre-fix ~66%-coverage multiset sampling")
 
     # Determine stop_at_step: priority is max_actual_train_steps from config,
     # then stop_at_step from command line, then max_train_steps from config
@@ -2793,7 +3064,7 @@ def main():
     if config.get("report_to") == "wandb":
         import wandb
         # Use project from training run info if available, otherwise use logging_dir or default
-        wandb_project = training_project if training_project else config.get("logging_dir", "validation")
+        wandb_project = training_project if training_project else config.get("logging_dir", "roentgen-validation")
         
         # Prepare wandb init kwargs
         wandb_init_kwargs = {
@@ -2914,7 +3185,7 @@ def main():
     else:
         # For tensorboard or other trackers
         accelerator.init_trackers(
-            project_name=config.get("logging_dir", "validation"),
+            project_name=config.get("logging_dir", "roentgen-validation"),
             config=config,
         )
 
@@ -3146,7 +3417,10 @@ def main():
         )
 
         # Use test_sync in test mode, train_sync in train mode, GT_sync in GT mode, validation_sync otherwise (backward compatible)
-        if test_mode:
+        # Multi-seed test mode uses a separate sync dir so it can run alongside a single-seed test job
+        if test_mode and config.get("test_seeds_mode", False):
+            sync_dir_name = "test_sync_seeds"
+        elif test_mode:
             sync_dir_name = "test_sync"
         elif train_mode:
             sync_dir_name = "train_sync"
@@ -3154,6 +3428,12 @@ def main():
             sync_dir_name = "GT_sync"
         else:
             sync_dir_name = "validation_sync"
+        # gen_shard jobs are single-process and self-sufficient: give each its OWN sync dir.
+        # A shared current_checkpoint.json is a race — every job removes the stale file at
+        # startup, so concurrent shards (or two concurrent seed DAGs on one output_dir) can
+        # wipe each other's assignment and exit having generated nothing (jobs 122892/3).
+        if config.get("gen_shard"):
+            sync_dir_name = f"{sync_dir_name}_shard{str(config['gen_shard']).replace(':', 'of')}"
         sync_dir = Path(config["output_dir"]) / sync_dir_name
         if accelerator.is_main_process:
             sync_dir.mkdir(parents=True, exist_ok=True)
@@ -3184,20 +3464,29 @@ def main():
             # Convert checkpoint_numbers to a set for fast lookup
             target_checkpoints = set(checkpoint_numbers)
             last_processed_step = -1
-            
-            # Helper function to process a single checkpoint
+
+            # Multi-seed regeneration: list of seeds to apply per checkpoint, or [None] for single-pass.
+            # When seed is not None, manifest entries are keyed as 'checkpoint-<N>_seed_<S>' so that
+            # each (checkpoint, seed) pair is tracked independently and can be resumed.
+            seeds_to_run = list(test_seeds_list) if test_seeds_list is not None else [None]
+
+            def _seed_manifest_key(checkpoint_dir, seed):
+                """Synthetic Path whose .name is the manifest key for (checkpoint, seed)."""
+                if seed is None:
+                    return checkpoint_dir
+                return checkpoint_dir.parent / f"{checkpoint_dir.name}_seed_{seed}"
+
+            # Helper function to process a single checkpoint (across all seeds)
             def process_checkpoint(checkpoint_step, checkpoint_dir):
-                """Process a single checkpoint - returns True if successful"""
+                """Process a single checkpoint across all configured seeds. Returns True iff every seed succeeded."""
                 logger.info(f"\n{'='*60}")
-                logger.info(f"TEST MODE: Validating checkpoint: {checkpoint_dir.name} (step {checkpoint_step})")
+                if test_seeds_list is not None:
+                    logger.info(f"TEST MODE: Validating checkpoint: {checkpoint_dir.name} (step {checkpoint_step}), seeds: {seeds_to_run}")
+                else:
+                    logger.info(f"TEST MODE: Validating checkpoint: {checkpoint_dir.name} (step {checkpoint_step})")
                 logger.info(f"{'='*60}")
-                
-                # Mark as in progress
-                if accelerator.is_main_process:
-                    monitor.mark_in_progress(checkpoint_dir)
-                    logger.info("✓ Marked checkpoint as in progress in manifest")
-                
-                # Publish assignment for all ranks
+
+                # Publish assignment for all ranks (one assignment per checkpoint - seed loop runs inside all ranks)
                 if accelerator.is_main_process:
                     assignment = {
                         "step": int(checkpoint_step),
@@ -3209,7 +3498,7 @@ def main():
                             json.dump(assignment, f)
                     except Exception as e:
                         logger.error(f"Failed to write checkpoint assignment file: {e}")
-                
+
                 # Wait for all ranks to see the assignment
                 step, checkpoint_dir_str = _wait_for_new_checkpoint_task(
                     sync_dir=sync_dir,
@@ -3217,76 +3506,125 @@ def main():
                     check_interval=1,  # Check quickly in test mode
                     accelerator=accelerator,
                 )
-                
+
                 if step is None or checkpoint_dir_str is None:
                     logger.error(f"Failed to get checkpoint assignment for step {checkpoint_step}")
                     if accelerator.is_main_process:
-                        monitor.mark_validated(checkpoint_dir, {}, success=False, num_images=0)
+                        for seed in seeds_to_run:
+                            monitor.mark_validated(_seed_manifest_key(checkpoint_dir, seed), {}, success=False, num_images=0)
+                    if config.get("gen_only"):
+                        raise RuntimeError(
+                            f"gen_only shard {config.get('gen_shard')} could not obtain its checkpoint "
+                            f"assignment for step {checkpoint_step}; refusing to exit 0 with no images "
+                            f"(an afterok-gated metrics job must not be released by an empty shard)."
+                        )
                     return False
-                
+
                 checkpoint_dir = Path(checkpoint_dir_str)
-                
+
+                # Load checkpoint ONCE before the seed loop (re-loading per seed is wasted work)
                 try:
-                    # Load checkpoint only if we're generating images (not loading from directory)
                     if not load_images_from_dir:
                         runner.load_checkpoint(checkpoint_dir)
                     else:
                         logger.info("Skipping checkpoint loading (loading pre-generated images from directory)")
-                    
-                    # Run validation for this checkpoint step
-                    metrics = runner.run_validation(checkpoint_step)
-                    
-                    # Log metrics to wandb/tensorboard (main process only)
-                    if metrics and accelerator.is_main_process:
-                        try:
-                            num_images = metrics.get("_num_images", 0)
-                            metrics_for_logging = {k: v for k, v in metrics.items() if k != "_num_images"}
-                            
-                            if config.get("report_to") == "wandb":
-                                import wandb
-                                if wandb.run is not None:
-                                    for metric_name in metrics_for_logging.keys():
-                                        try:
-                                            wandb.define_metric(metric_name, step_metric="global_step", summary="last")
-                                        except:
-                                            try:
-                                                wandb.define_metric(metric_name, summary="last")
-                                            except:
-                                                pass
-                            
-                            log_dict = dict(metrics_for_logging)
-                            log_dict["test_step"] = checkpoint_step
-                            
-                            if config.get("report_to") == "wandb":
-                                import wandb
-                                if wandb.run is not None:
-                                    wandb.log(log_dict, step=checkpoint_step)
-                            else:
-                                accelerator.log(metrics_for_logging, step=checkpoint_step)
-                            
-                            logger.info(f"✓ Metrics logged to {config.get('report_to', 'tracker')} at step {checkpoint_step}")
-                        except Exception as e:
-                            logger.warning(f"Failed to log metrics: {e}")
-                            import traceback
-                            logger.warning(traceback.format_exc())
-                    
-                    # Mark as validated - ONLY on main process
-                    if accelerator.is_main_process:
-                        num_images = metrics.get("_num_images", 0) if metrics else 0
-                        metrics_for_manifest = {k: v for k, v in metrics.items() if k != "_num_images"} if metrics else {}
-                        monitor.mark_validated(checkpoint_dir, metrics_for_manifest, success=True, num_images=num_images)
-                    
-                    logger.info(f"✓ TEST MODE: Checkpoint {checkpoint_dir.name} validated successfully")
-                    return True
-                    
                 except Exception as e:
-                    logger.error(f"Failed to validate checkpoint {checkpoint_dir}: {e}")
+                    logger.error(f"Failed to load checkpoint {checkpoint_dir}: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
-                    # Mark as failed - ONLY on main process
                     if accelerator.is_main_process:
-                        monitor.mark_validated(checkpoint_dir, {}, success=False, num_images=0)
+                        for seed in seeds_to_run:
+                            monitor.mark_validated(_seed_manifest_key(checkpoint_dir, seed), {}, success=False, num_images=0)
                     return False
+
+                all_ok = True
+                for seed in seeds_to_run:
+                    key_path = _seed_manifest_key(checkpoint_dir, seed)
+
+                    # Per-seed idempotency: skip seeds already completed for this checkpoint
+                    if accelerator.is_main_process:
+                        prior = monitor.validated_checkpoints.get(key_path.name, {})
+                        if prior.get("status") == "completed":
+                            seed_label = f" (seed {seed})" if seed is not None else ""
+                            logger.info(f"Already validated{seed_label}, skipping")
+                            continue
+                        monitor.mark_in_progress(key_path)
+                        seed_label = f" (seed {seed})" if seed is not None else ""
+                        logger.info(f"✓ Marked {checkpoint_dir.name}{seed_label} as in progress in manifest")
+
+                    # Apply per-seed override of the noise-sampling seed
+                    if seed is not None:
+                        config["validation_seed"] = seed
+                        runner.args["validation_seed"] = seed
+                        logger.info(f"TEST MODE: Running validation for {checkpoint_dir.name} (seed {seed})")
+
+                    try:
+                        # Run validation for this checkpoint step (uses current validation_seed)
+                        metrics = runner.run_validation(checkpoint_step)
+
+                        # Log metrics to wandb/tensorboard (main process only)
+                        if metrics and accelerator.is_main_process:
+                            try:
+                                num_images = metrics.get("_num_images", 0)
+                                metrics_for_logging = {k: v for k, v in metrics.items() if k != "_num_images"}
+
+                                if config.get("report_to") == "wandb":
+                                    import wandb
+                                    if wandb.run is not None:
+                                        for metric_name in metrics_for_logging.keys():
+                                            try:
+                                                wandb.define_metric(metric_name, step_metric="global_step", summary="last")
+                                            except:
+                                                try:
+                                                    wandb.define_metric(metric_name, summary="last")
+                                                except:
+                                                    pass
+
+                                log_dict = dict(metrics_for_logging)
+                                log_dict["test_step"] = checkpoint_step
+                                if seed is not None:
+                                    log_dict["test_seed"] = seed
+
+                                if config.get("report_to") == "wandb":
+                                    import wandb
+                                    if wandb.run is not None:
+                                        wandb.log(log_dict, step=checkpoint_step)
+                                else:
+                                    accelerator.log(metrics_for_logging, step=checkpoint_step)
+
+                                seed_suffix = f" (seed {seed})" if seed is not None else ""
+                                logger.info(f"✓ Metrics logged at step {checkpoint_step}{seed_suffix}")
+                            except Exception as e:
+                                logger.warning(f"Failed to log metrics: {e}")
+                                import traceback
+                                logger.warning(traceback.format_exc())
+
+                        # Mark as validated - ONLY on main process
+                        if accelerator.is_main_process:
+                            num_images = metrics.get("_num_images", 0) if metrics else 0
+                            metrics_for_manifest = {k: v for k, v in metrics.items() if k != "_num_images"} if metrics else {}
+                            monitor.mark_validated(key_path, metrics_for_manifest, success=True, num_images=num_images)
+
+                        seed_suffix = f" seed {seed}" if seed is not None else ""
+                        logger.info(f"✓ TEST MODE: Checkpoint {checkpoint_dir.name}{seed_suffix} validated successfully")
+
+                    except Exception as e:
+                        seed_suffix = f" (seed {seed})" if seed is not None else ""
+                        logger.error(f"Failed to validate {checkpoint_dir}{seed_suffix}: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        if accelerator.is_main_process:
+                            monitor.mark_validated(key_path, {}, success=False, num_images=0)
+                        all_ok = False
+                        # Continue with remaining seeds even if one fails
+
+                # In multi-seed mode, also write a summary entry under the bare checkpoint name once
+                # all seeds are complete. This lets get_new_checkpoints() skip the checkpoint on
+                # future runs (continuous mode), since per-seed keys aren't recognised by it.
+                if accelerator.is_main_process and test_seeds_list is not None and all_ok:
+                    monitor.mark_validated(checkpoint_dir, {}, success=True, num_images=0)
+
+                return all_ok
             
             # One-time mode: process checkpoints once and exit
             if not test_continuous:

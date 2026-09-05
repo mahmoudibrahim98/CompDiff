@@ -80,10 +80,6 @@ def parse_age_bin(prompt: str, bins=None) -> int:
     """
     Extract age from prompt and map to bin index.
 
-    Supports both formats:
-    - Format A: "45 year old BLACK MALE. ..."
-    - Fundus: "SLO fundus image of a Black, Male, 45 years old patient ..."
-
     Default bins: [0-18, 18-40, 40-60, 60-80, 80+]
     Can be changed using set_default_age_bins() or by passing bins parameter.
 
@@ -99,7 +95,6 @@ def parse_age_bin(prompt: str, bins=None) -> int:
     Example:
         # Use default bins
         bin_idx = parse_age_bin("45 year old patient")
-        bin_idx = parse_age_bin("SLO fundus image of a Black, Male, 45 years old patient")
         
         # Use custom bins for this call
         bin_idx = parse_age_bin("45 year old patient", bins=[20, 40, 60, 80])
@@ -111,8 +106,7 @@ def parse_age_bin(prompt: str, bins=None) -> int:
     if bins is None:
         bins = _DEFAULT_AGE_BINS
     
-    # Match both "year" and "years" (case-insensitive), handles both formats
-    match = re.search(r'(\d+)\s*years?\s*(?:old)?', prompt, re.IGNORECASE)
+    match = re.search(r'(\d+)\s*year', prompt, re.IGNORECASE)
     if not match:
         return 0  # Default to youngest bin if not found
 
@@ -123,24 +117,14 @@ def parse_age_bin(prompt: str, bins=None) -> int:
     return len(bins)  # Last bin (e.g., 80+)
 
 def parse_age_continuous(prompt: str, default_age: float = 50.0) -> float:
-    """
-    Extract age as continuous value from prompt.
-    
-    Supports both formats:
-    - Format A: "45 year old BLACK MALE. ..."
-    - Fundus: "SLO fundus image of a Black, Male, 45 years old patient ..."
-    """
-    match = re.search(r'(\d+)\s*years?\s*(?:old)?', prompt, re.IGNORECASE)
+    import re
+    match = re.search(r'(\d+)\s*year', prompt, re.IGNORECASE)
     if match:
         return max(0.0, min(100.0, float(match.group(1))))
     return default_age
 def parse_sex(prompt: str) -> int:
     """
     Extract sex from prompt.
-
-    Supports both formats:
-    - Format A: "45 year old BLACK MALE. ..."
-    - Fundus: "SLO fundus image of a Black, Male, 45 years old patient ..."
 
     Returns:
         0: male
@@ -159,21 +143,13 @@ def parse_race(prompt: str) -> int:
     """
     Extract race/ethnicity from prompt.
 
-    Supports both formats:
-    - Format A: "45 year old BLACK MALE. ..." (uppercase)
-    - Fundus: "SLO fundus image of a Black, Male, 45 years old patient ..." (capitalized)
-
-    Note: For fundus prompts with both race and ethnicity (e.g., "White, Male, Hispanic"),
-    this function will prioritize Hispanic/Latino if found, as it's checked first.
-    This matches the original behavior for Format A.
-
     Returns:
         0: White
         1: Black/African American
         2: Asian
         3: Hispanic/Latino
     """
-    prompt_upper = prompt.upper()  # Convert to uppercase for case-insensitive matching
+    prompt_upper = prompt.upper()  # RoentGen uses uppercase for race
 
     if 'BLACK' in prompt_upper or 'AFRICAN' in prompt_upper:
         return 1
@@ -189,11 +165,8 @@ def extract_clinical_text(prompt: str, keep_age: bool = False) -> str:
     """
     Extract clinical findings from full prompt (removes demographics).
 
-    Supports both formats:
-    - Format A: "XX year old RACE GENDER. CLINICAL_FINDINGS"
-      → Extracts everything after the first period
-    - Fundus: "SLO fundus image of a RACE, GENDER, AGE patient with the following conditions: CLINICAL_FINDINGS"
-      → Extracts everything after "with the following conditions: "
+    RoentGen format: "XX year old RACE GENDER. CLINICAL_FINDINGS"
+    We extract everything after the first period.
 
     Args:
         prompt: Full prompt with demographics and clinical text
@@ -202,27 +175,7 @@ def extract_clinical_text(prompt: str, keep_age: bool = False) -> str:
     Returns:
         Clinical text only (without demographics, or with age if keep_age=True)
     """
-    # Check for fundus format first: "with the following conditions: "
-    fundus_pattern = "with the following conditions:"
-    if fundus_pattern.lower() in prompt.lower():
-        # Extract everything after "with the following conditions: "
-        idx = prompt.lower().find(fundus_pattern.lower())
-        clinical_text = prompt[idx + len(fundus_pattern):].strip()
-        
-        if not clinical_text:
-            clinical_text = "Normal chest radiograph"
-        
-        if keep_age:
-            # Extract age from prompt
-            age_match = re.search(r'(\d+\s*years?\s*old)', prompt, re.IGNORECASE)
-            if age_match:
-                age_str = age_match.group(1)
-                return f"{age_str}. {clinical_text}"
-        
-        return clinical_text
-    
-    # Format A: split on period
-    parts = prompt.split('.', 1)  # Split on first period
+    parts = prompt.split('.', 1) # this is correct. i debugged it and it splits into two parts, and take everything after the first '.' as clinical text (including all '.'s)
     if len(parts) > 1:
         clinical_text = parts[1].strip()
         if not clinical_text:
@@ -230,7 +183,7 @@ def extract_clinical_text(prompt: str, keep_age: bool = False) -> str:
         
         if keep_age:
             # Extract age from the first part (before the period)
-            age_match = re.search(r'(\d+\s*years?\s*old)', prompt, re.IGNORECASE)
+            age_match = re.search(r'(\d+\s*year\s*old)', prompt, re.IGNORECASE)
             if age_match:
                 age_str = age_match.group(1)
                 return f"{age_str}. {clinical_text}"
@@ -271,6 +224,16 @@ class RGFineTuningWebDataset(IterableDataset):
         self.webdataset = wds.DataPipeline(
             wds.SimpleShardList(url_list),
             # at this point we have an iterator over all the shards
+            #
+            # split_by_worker MUST come BEFORE any shuffle. wds.shuffle seeds
+            # from pid+clock, so each DataLoader worker orders the shard list
+            # differently; splitting AFTER a shuffle slices differently-ordered
+            # lists and the per-worker subsets overlap (measured on the 63-shard
+            # set with 8 workers: 24 shards missing, 18 duplicated — and the
+            # failure is stochastic, so a single passing run proves nothing).
+            # With num_workers=0 this stage is a no-op (no worker info -> all
+            # shards pass through), preserving the exact legacy behaviour.
+            wds.split_by_worker,
             wds.shuffle(100),
             wds.tarfile_to_samples(),
             wds.shuffle(1000),
@@ -339,28 +302,9 @@ class RGFineTuningWebDataset(IterableDataset):
         
         sample = {}
 
-        # Load image tensor from pickle
-        loaded_tensor = pickle.loads(item["pt_image"])
-        
-        # Handle different image formats:
-        # - (H, W): grayscale, needs channel dim and expansion to RGB
-        # - (1, H, W): single channel, needs expansion to RGB
-        # - (3, H, W): RGB, use as-is
-        if len(loaded_tensor.shape) == 2:
-            # Grayscale (H, W) - add channel and expand to RGB
-            sample["pixel_values"] = loaded_tensor.unsqueeze(0).expand(3, -1, -1)
-        elif len(loaded_tensor.shape) == 3:
-            if loaded_tensor.shape[0] == 1:
-                # Single channel (1, H, W) - expand to RGB
-                sample["pixel_values"] = loaded_tensor.expand(3, -1, -1)
-            elif loaded_tensor.shape[0] == 3:
-                # RGB (3, H, W) - use as-is
-                sample["pixel_values"] = loaded_tensor
-            else:
-                raise ValueError(f"Unexpected image shape: {loaded_tensor.shape}. Expected (H, W), (1, H, W), or (3, H, W)")
-        else:
-            raise ValueError(f"Unexpected image shape: {loaded_tensor.shape}. Expected 2D or 3D tensor")
-        
+        sample["pixel_values"] = (
+            pickle.loads(item["pt_image"]).unsqueeze(0).expand(3, -1, -1)
+        )
         sample["pixel_values"] = self.image_transforms(sample["pixel_values"])
 
         # Note: __key__ is NOT included in sample to avoid Accelerate concatenation errors
@@ -443,23 +387,32 @@ class RGFineTuningWebDataset(IterableDataset):
         # Training datasets should NOT include this to avoid Accelerate concatenation errors
         if self.include_text:
             sample["text"] = prompt
+            # Sample identity for deterministic evaluation ordering and
+            # coverage auditing (validation/test only; strings are safe here
+            # because include_text batches already carry string fields).
+            # Composite <tar>::<key>: bare __key__ values are per-tar sequences
+            # (000001...) that COLLIDE across tars, which would make key-sorting
+            # unstable and key-based auditing ambiguous.
+            import os as _os
+            _tar = _os.path.basename(item.get("__url__", ""))
+            sample["sample_key"] = f"{_tar}::{item['__key__']}"
 
         return sample
 
     def __iter__(self):
-        info = get_worker_info()
-        num_workers = info.num_workers if info is not None else 1
-        id = info.id if info is not None else 0
-
+        # Worker sharding is handled at the SHARD level by wds.split_by_worker
+        # in the pipeline above. The old `i % num_workers == id` sample filter
+        # here was only correct for num_workers=0/1: with parallel workers it
+        # selected every Nth sample from an *independently shuffled* per-worker
+        # stream, which both drops and duplicates samples. Do not reintroduce it.
         self.source = iter(self.webdataset)
-        for i, item in enumerate(self.source):
-            if i % num_workers == id:
-                # with no data filter, simply yield next item
-                if self.data_filter is None:
-                    yield self.wds_item_to_sample(item)
-                # if data filter is provided, only yield items with dicom_ids in the filter
-                elif item["__key__"] in self.data_filter:
-                    yield self.wds_item_to_sample(item)
+        for item in self.source:
+            # with no data filter, simply yield next item
+            if self.data_filter is None:
+                yield self.wds_item_to_sample(item)
+            # if data filter is provided, only yield items with dicom_ids in the filter
+            elif item["__key__"] in self.data_filter:
+                yield self.wds_item_to_sample(item)
 
 
 #####################################################

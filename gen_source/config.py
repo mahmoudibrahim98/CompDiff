@@ -122,10 +122,9 @@ class BaseConfig:
     # ====== HCN (Hierarchical Conditioner Network) Parameters ======
     # Whether to use HCN for compositional demographic embeddings
     use_hcn: bool = False
-    # Note: use_hcn_v8 and use_hcn_v7 are deprecated - HCN is now the default
-    # These flags are kept for backward compatibility but are no longer needed
-    use_hcn_v8: bool = False  # Deprecated: no longer needed, kept for compatibility
-    use_hcn_v7: bool = False  # Deprecated: no longer needed, kept for compatibility
+    # Whether to use HCN V7 (hcn_v7.py) instead of default HCN (hcn.py)
+    # When True, uses HierarchicalConditionerV8 from hcn_v7.py with auxiliary loss on token
+    use_hcn_v7: bool = False
     # Hidden dimension for HCN embeddings
     hcn_d_node: int = 256
     # Output dimension for HCN (should match text encoder output, e.g., 1024 for SD 2.1)
@@ -165,14 +164,93 @@ class BaseConfig:
     hcn_age_loss_mode: str = 'ce'
     # Gaussian sigma for soft_ce mode (only used when hcn_age_loss_mode='soft_ce')
     hcn_soft_ce_sigma: float = 0.75
+    # Whether to use FiLM conditioning instead of token concatenation (V5)
+    # When True, HCN outputs FiLM parameters (gamma, beta) that modulate UNet features
+    # When False, HCN outputs a token that gets concatenated with text embeddings (V1 behavior)
+    use_hcn_film: bool = False
+    # Hidden dimension for FiLM adapter MLP
+    film_d_hidden: int = 512
+    # Scale factor for FiLM modulation (0=identity, 1=full modulation)
+    # Can be used to gradually introduce FiLM conditioning during training
+    film_scale: float = 1.0
+    # Which UNet blocks to apply FiLM to: 'all', 'down', 'mid', 'up'
+    film_blocks: str = 'all'
     
     # ====== V6: Timestep Embedding Injection ======
     # When True, HCN outputs an embedding that gets ADDED to UNet's timestep embedding
+    # This is simpler and more reliable than FiLM hooks
     use_hcn_timestep_injection: bool = False
     # Timestep embedding dimension (1280 for SD 2.1, 4 * block_out_channels[0])
     hcn_d_time_emb: int = 1280
-    # Disable FiLM mode (mutually exclusive with timestep injection)
-    use_hcn_film: bool = False
+    
+    # ====== V9: Continuous Age Support ======
+    # When True, HCN uses continuous age values instead of categorical age bins
+    # This enables regression-based age encoding (V9)
+    use_continuous_age: bool = False
+    # Maximum age for normalization (used when use_continuous_age=True)
+    max_age: int = 100
+
+    # Seconds rank 0 waits for all ranks' done-markers before metrics; on
+    # expiry the validation monitor RAISES rather than scoring a partial
+    # image set (Snellius §2.1 silent-FID-overstatement bug).
+    validation_generation_timeout: int = 1800
+
+    # ====== LR scheduler scaling fix (root-caused 2026-08-13) ======
+    # The accelerate-prepared scheduler steps once PER PROCESS per optimizer
+    # step, so a scheduler configured with max_train_steps ticks completes its
+    # half-cosine in max_train_steps/num_processes optimizer steps and the
+    # diffusers cosine (rectified, progress unclamped) then CYCLES: period
+    # 10k optimizer steps on the 6-GPU node, 15k on 4 GPUs. Every run before
+    # 2026-08-13 trained on that cyclic lr. When True, num_training_steps and
+    # num_warmup_steps are multiplied by num_processes so the intended single
+    # anneal actually ends at max_train_steps. False preserves the legacy
+    # (cyclic) behaviour exactly, for comparability reruns.
+    scale_lr_steps_by_num_processes: bool = False
+
+    # ====== DataLoader performance (Snellius handback 2026-08-12) ======
+    # With the default 0 workers, all sample decoding runs inline in the
+    # training process; profiling on 4xA100 showed 90% of every step blocked
+    # in the dataloader (5.4 -> 1.1 s/step after the fix). 0 preserves the
+    # exact legacy behaviour; set 8 to enable parallel decode workers.
+    dataloader_num_workers: int = 0
+    dataloader_pin_memory: bool = True
+    dataloader_prefetch_factor: int = 4
+
+    # ====== CompDiff-2: Typed Compositional Conditioner (compdiff2.py) ======
+    # When True, load CompDiff2Conditioner instead of any HCN variant.
+    # Requires use_hcn: true (reuses the HCN slot in train/validation/dataset).
+    # Reuses hcn_d_node, hcn_d_ctx, hcn_dropout, hcn_use_uncertainty,
+    # hcn_aux_hidden_dim, hcn_aux_weight(+ per-attr), hcn_kl_*, hcn_comp_weight,
+    # hcn_num_age_bins (joint aux head only), hcn_num_sex, hcn_num_race,
+    # hcn_d_time_emb, max_age.
+    use_compdiff2: bool = False
+    # Composer: 'hierarchical' (CompDiff-1 pairwise topology, typed inputs),
+    # 'transformer' (2-layer encoder over attribute tokens + CLS) [stage 2d],
+    # or 'flat' (parameter/depth-matched NON-factorized control; review item 3)
+    cd2_composer: str = 'hierarchical'
+    # Multi-token output (t_age, t_sex, t_race, t_cls) vs single fused token [stage 2b]
+    cd2_multi_token: bool = False
+    # Route B: zero-init projection of CLS latent added to UNet timestep embedding [stage 2c]
+    cd2_route_b: bool = False
+    # Extra unsupervised register tokens (multi-token mode only)
+    cd2_num_registers: int = 0
+    # Per-sample per-attribute dropout to learned null embeddings [stage 2e]
+    cd2_attr_dropout_prob: float = 0.0
+    # Per-sample probability of dropping ALL attributes (CFG-style) [stage 2e]
+    cd2_full_dropout_prob: float = 0.0
+    # Sinusoidal feature dimension of the continuous age encoder
+    cd2_age_freq_dim: int = 128
+    # Weight of the joint-cell CE term inside the aux loss average
+    cd2_aux_weight_joint: float = 0.5
+    # Scale on the SmoothL1 age regression term (commensurate with CE terms)
+    cd2_age_loss_scale: float = 10.0
+    # Transformer composer size (only used when cd2_composer='transformer')
+    cd2_transformer_layers: int = 2
+    cd2_transformer_heads: int = 4
+    # Hidden width of the 'flat' composer (only used when cd2_composer='flat').
+    # 664 parameter-matches the hierarchical multi-token composer to within 0.1%
+    # (2,898,632 vs 2,896,640) at d_node=256 -- the non-compositional control.
+    cd2_flat_hidden: int = 664
 
     # ====== Demographic Encoder (V4) Parameters ======
     # Whether to use DemographicEncoder (lightweight embeddings-based conditioning)
@@ -229,21 +307,6 @@ class BaseConfig:
         default_factory=lambda: ["race_idx", "sex_idx", "age_idx"]
     )
     fairdiffusion_attribute_cardinalities: Dict[str, int] = field(default_factory=dict)
-
-    # ====== FairCLIP Regularizer (Option 1: fairness loss via frozen FairCLIP) ======
-    # When True, add a Sinkhorn-based fairness loss so image–text similarity is balanced across demographic groups.
-    use_fairclip_regularizer: bool = False
-    # Path to FairCLIP checkpoint (.pth with 'model_state_dict' from FairCLIP training).
-    fairclip_checkpoint_path: str = None
-    # Attribute to balance: race_idx | sex_idx (must exist in batch).
-    fairclip_attribute: str = "race_idx"
-    # Weight for the FairCLIP fairness loss (e.g. 1e-4).
-    fairclip_loss_weight: float = 1e-4
-    # Sinkhorn blur for geomloss (e.g. 1e-4).
-    fairclip_sinkhorn_blur: float = 1e-4
-    # FairCLIP model arch (must match checkpoint): vit-b16 | vit-l14
-    fairclip_model_arch: str = "vit-b16"
-
     # ====== Validation Parameters ======
     # Whether to run validation during training
     run_validation: bool = False
@@ -284,20 +347,6 @@ class BaseConfig:
     # Whether to compute subgroup-specific metrics (FID, MS-SSIM, BioViL per sex/race/age and intersectional subgroups)
     # This can significantly increase validation time, so it's disabled by default
     compute_subgroup_metrics: bool = False
-    # Whether to compute disease AUROC during validation
-    compute_disease_auroc: bool = False
-    # Whether to compute fundus disease AUROC (glaucoma/CDR) during validation
-    compute_fundus_disease_auroc: bool = False
-    # Whether to compute demographic prediction metrics during validation
-    compute_demographic_prediction: bool = False
-    # Whether to compute BioViL similarity during validation
-    compute_biovil_similarity: bool = False
-    # Whether to compute FID with RadImageNet during validation
-    compute_fid_radimagenet: bool = False
-    # Whether to compute FairDiffusion metrics (FID, MIFID, IS) during validation
-    compute_fairdiffusion_metrics: bool = False
-    # Demographic groups for FairDiffusion groupwise metrics (e.g. [" Asian", " Black", " Female", " Male"])
-    demographic_groups: List[str] = field(default_factory=list)
     # Path to test directory (used for test mode validation)
     test_dir: str = None
     # Path to test CSV file

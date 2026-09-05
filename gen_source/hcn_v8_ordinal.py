@@ -1,19 +1,21 @@
 """
-Hierarchical Conditioner Network with Ordinal Age Loss
+Hierarchical Conditioner Network V8 with Ordinal Age Loss (Backward Compatible)
 
-This version maintains the SAME architecture as hcn.py but adds ordinal loss options.
-This allows resuming from existing checkpoints.
+This version maintains the SAME architecture as hcn_v7.py but adds ordinal loss options.
+This allows resuming from existing V7 checkpoints.
 
-Key difference from hcn.py:
+Key difference from hcn_v8_ordinal.py:
 - Uses same nn.Sequential structure for age_classifier (backward compatible)
 - Only the LOSS computation changes, not the model architecture
-- Can resume from existing checkpoints
+- Can resume from V7 checkpoints
 
 Age Loss Options:
-    'ce':       Standard cross-entropy (original V8 behavior)
+    'ce':       Standard cross-entropy (original V7 behavior)
     'soft_ce':  Soft labels with Gaussian smoothing around true bin
     'ordinal':  Ordinal regression adapted for K outputs (not K-1)
     'mse':      Mean squared error treating bins as numeric (0, 1, 2, 3, 4)
+
+Authors: RoentGen V8 Team
 """
 
 import torch
@@ -44,7 +46,7 @@ class HierarchicalConditionerV8Ordinal(nn.Module):
     """
     V8 with Ordinal Age Loss (Backward Compatible Version)
     
-    IMPORTANT: This version uses the SAME architecture as hcn.py.
+    IMPORTANT: This version uses the SAME architecture as V7 (hcn_v7.py).
     Only the loss computation changes based on age_loss_mode.
     This allows resuming from V7 checkpoints.
     
@@ -523,9 +525,9 @@ def compute_aux_loss(
 
 def load_hcn_v8_ordinal(args, logger):
     """
-    Load and initialize HCN with ordinal age loss.
+    Load and initialize HCN V8 with ordinal age loss (backward compatible).
     
-    This version uses the SAME architecture as hcn.py, allowing checkpoint resume.
+    This version uses the SAME architecture as V7, allowing checkpoint resume.
     Only the loss computation changes based on age_loss_mode.
     
     Config options:
@@ -537,7 +539,7 @@ def load_hcn_v8_ordinal(args, logger):
         return None
     
     logger.info("=" * 60)
-    logger.info("Initializing HCN with Ordinal Age Loss")
+    logger.info("Initializing HCN V8 with Ordinal Age Loss")
     logger.info("=" * 60)
     
     use_aux_loss = getattr(args, 'hcn_aux_weight', 0.0) > 0.0
@@ -621,7 +623,7 @@ def test_losses():
 
 
 def test_backward_compat():
-    """Test that architecture matches hcn.py."""
+    """Test that architecture matches V7."""
     print("\nTesting backward compatibility...")
     print("=" * 60)
     
@@ -635,7 +637,7 @@ def test_backward_compat():
         age_loss_mode='ordinal',
     )
     
-    # Check state_dict keys match hcn.py format
+    # Check state_dict keys match V7 format
     state_dict = hcn.state_dict()
     age_keys = [k for k in state_dict.keys() if 'age_classifier' in k]
     
@@ -643,9 +645,9 @@ def test_backward_compat():
     
     # Should be: age_classifier.0.*, age_classifier.1.*, etc.
     expected_pattern = any('age_classifier.0.' in k for k in age_keys)
-    assert expected_pattern, "Architecture doesn't match hcn.py!"
+    assert expected_pattern, "Architecture doesn't match V7!"
     
-    print("✓ Architecture matches hcn.py (backward compatible)")
+    print("✓ Architecture matches V7 (backward compatible)")
     
     # Test forward pass
     batch_size = 8

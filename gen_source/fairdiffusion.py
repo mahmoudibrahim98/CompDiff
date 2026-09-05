@@ -31,7 +31,7 @@ class FairnessResult:
 class FairDiffusionController:
     """
     Implements the FairDiffusion adaptive re-weighting procedure described in
-    FairDiffusion for Stable Diffusion fine-tuning.
+    https://github.com/mahmoudibrahim98/FairDiffusion for Stable Diffusion fine-tuning.
     """
 
     def __init__(self, args, accelerator, logger):

@@ -1,0 +1,134 @@
+# CompDiff training configuration - retinal fundus (FairGenMed)
+#
+# Same typed compositional conditioner as the chest configuration with three
+# race classes (White, Black, Asian). This is the configuration of the three
+# fundus runs reported in the paper: per-device batch 24 on 4 GPUs (global
+# batch 96), 30k steps, checkpoint 17,500 selected on the validation split.
+#
+# Paths below point at the demo WebDatasets; replace them with your own
+# FairGenMed WebDataset (see prepare_datasets/prepare_fundus_dataset.py).
+#
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1-base"
+pretrained_text_encoder_name_or_path: null
+train_text_encoder: true
+
+embedding_method: "last_hidden_state"
+enforce_tokenizer_max_sentence_length: 77
+output_dir: "./outputs/compdiff/fundus"
+seed: 42
+resolution: 512
+
+dataloader_num_workers: 6   # = number of training shards; split_by_worker assigns whole shards, so >6 leaves workers idle
+train_batch_size: 24   # per device; 24 x 4 GPUs = global 96
+max_train_steps: 30000
+learning_rate: 1.0e-5
+gradient_accumulation_steps: 1   # accum is FORBIDDEN here (train_text_encoder + multi-GPU guard in train.py)
+mixed_precision: "bf16"
+use_ema: true
+lr_scheduler: "cosine"
+lr_warmup_steps: 500
+gradient_checkpointing: true
+
+# ==============================================================================
+# DATASET CONFIGURATION
+# ==============================================================================
+
+use_wds_dataset: true
+url_root: "./demo_fundus/training_data"
+image_type: "pt"
+
+# ==============================================================================
+# TEST DATASET Generation
+# ==============================================================================
+
+wds_dataset_path: "./demo_fundus/test_data"
+num_images_per_prompt: 1
+generation_batch_size: 8
+
+# ==============================================================================
+# CHECKPOINTING
+# ==============================================================================
+
+checkpointing_steps: 500
+checkpoints_total_limit: None
+resume_from_checkpoint: "latest"
+
+# ==============================================================================
+# CompDiff-2: TYPED COMPOSITIONAL CONDITIONER
+# ==============================================================================
+
+# Reuse the HCN slot in train/validation/dataset plumbing
+use_hcn: true
+use_hcn_v7: false
+use_compdiff2: true
+
+# Stage switches
+cd2_composer: "hierarchical"        # hierarchical | transformer
+cd2_multi_token: true
+cd2_route_b: false
+cd2_num_registers: 0
+cd2_attr_dropout_prob: 0.0
+cd2_full_dropout_prob: 0.0
+
+# Typed age encoder
+cd2_age_freq_dim: 128
+max_age: 100
+
+# Aux loss shape
+cd2_aux_weight_joint: 0.5
+cd2_age_loss_scale: 10.0
+
+# Transformer composer size (ignored unless cd2_composer=transformer)
+cd2_transformer_layers: 2
+cd2_transformer_heads: 4
+
+# Shared conditioner dimensions (same as CompDiff-1 for comparability)
+hcn_d_node: 256
+hcn_d_ctx: 1024
+hcn_d_time_emb: 1280
+hcn_dropout: 0.1
+hcn_use_uncertainty: true
+hcn_aux_hidden_dim: 512
+
+# Category counts (age bins ONLY feed the joint aux head + monitoring)
+hcn_num_age_bins: 5
+hcn_num_sex: 2
+hcn_num_race: 3   # fundus: White/Black/Asian (CXR had 4 incl. Hispanic)
+
+# Loss weights (identical to CompDiff-1 defaults for comparability)
+hcn_kl_weight: 0.005
+hcn_kl_anneal_steps: 5000
+hcn_comp_weight: 0.1
+hcn_aux_weight: 1
+
+# ==============================================================================
+# VALIDATION CONFIGURATION
+# ==============================================================================
+
+run_validation: true
+validation_steps: 2500
+num_validation_samples: -1
+validation_schedule_offsets:
+  - -1500
+  - 0
+val_batch_size: 16 # 16 for a100, 8 for a5000 or rtx4090
+validation_csv: "./demo_fundus/val_data"
+validation_images_dir: "./demo_fundus/val_data"
+validation_sex_model_path: "./pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt"
+validation_num_images_per_prompt: 1
+validation_guidance_scale: 7.5
+validation_num_inference_steps: 75
+validation_save_images: true
+validation_metrics_batch_size: 8 # always keep at 8, regardless of gpu memory
+compute_subgroup_metrics: true
+# Age is inside the conditioner for CompDiff-2 -> strip the FULL demographic
+# prefix (including age) from prompts, in training (dataset default) and here.
+strip_demographics_in_validation: true
+test_dir: "./demo_fundus/test_data"
+
+# ==============================================================================
+# LOGGING
+# ==============================================================================
+
+logging_dir: "logs/compdiff/fundus"
+report_to: "wandb"

@@ -1,6 +1,7 @@
 ### Some sections of this code used the code of the huggingface diffusers repository.
 ### In particular from the file https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/train_dreambooth.py
 ### And the file https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image.py
+### Authors: Stefania Moroianu, Pierre Chambon
 
 ### Imports ###
 import itertools
@@ -32,7 +33,7 @@ check_min_version("0.27.0.dev0")
 from dataset_wds import RGFineTuningWebDataset, RGFineTuningImageDirectoryDataset, get_age_bins_from_num_bins, set_default_age_bins
 from train_loop import train_loop
 from pipeline import create_and_save_pipeline
-from models import load_models, EMAModel, load_hcn
+from models import load_models, EMAModel, load_hcn, load_film_components
 
 # Add project root to Python path
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -135,6 +136,12 @@ def main(args):
     # Load HCN (Hierarchical Conditioner Network)
     hcn = load_hcn(args, logger)
     
+    # Load FiLM components if HCN FiLM mode is enabled (V5)
+    # This wraps the UNet with FiLM modulation capability
+    film_adapter = None
+    if getattr(args, 'use_hcn_film', False) and hcn is not None:
+        film_adapter, unet = load_film_components(args, unet, logger)
+    
     # Load DemographicEncoder (V4)
     from demographic_encoder import load_demographic_encoder
     demographic_encoder = load_demographic_encoder(args, logger)
@@ -153,31 +160,6 @@ def main(args):
 
         fair_controller = FairDiffusionController(args, accelerator, logger)
 
-    # Optional: FairCLIP fairness regularizer (frozen FairCLIP + Sinkhorn loss across groups)
-    fairclip_model = None
-    fairclip_preprocess = None
-    fairclip_loss_fn = None
-    if getattr(args, "use_fairclip_regularizer", False) and getattr(args, "fairclip_checkpoint_path", None):
-        from fairclip_utils import load_fairclip_model
-        try:
-            from geomloss import SamplesLoss
-        except ImportError:
-            SamplesLoss = None
-        arch_map = {"vit-b16": "ViT-B/16", "vit-l14": "ViT-L/14"}
-        arch = arch_map.get(getattr(args, "fairclip_model_arch", "vit-b16"), "ViT-B/16")
-        fairclip_model, fairclip_preprocess = load_fairclip_model(
-            args.fairclip_checkpoint_path,
-            accelerator.device,
-            arch=arch,
-            logger=logger,
-        )
-        if fairclip_model is not None and SamplesLoss is not None:
-            fairclip_loss_fn = SamplesLoss(
-                loss="sinkhorn",
-                p=2,
-                blur=getattr(args, "fairclip_sinkhorn_blur", 1e-4),
-            )
-
     # Freeze vae and text_encoder
     if args.image_type == "pt":
         vae.requires_grad_(False)
@@ -191,6 +173,10 @@ def main(args):
     # HCN is trainable
     if hcn is not None:
         hcn.requires_grad_(True)
+    
+    # FiLM adapter is trainable (V5)
+    if film_adapter is not None:
+        film_adapter.requires_grad_(True)
     
     # DemographicEncoder is trainable
     if demographic_encoder is not None:
@@ -250,6 +236,11 @@ def main(args):
     if hcn is not None:
         params_to_optimize = itertools.chain(params_to_optimize, hcn.parameters())
         logger.info("Adding HCN parameters to optimizer")
+    
+    # Add FiLM adapter parameters to optimizer (V5)
+    if film_adapter is not None:
+        params_to_optimize = itertools.chain(params_to_optimize, film_adapter.parameters())
+        logger.info("Adding FiLM adapter parameters to optimizer (V5)")
     
     # Add DemographicEncoder parameters to optimizer
     if demographic_encoder is not None:
@@ -314,13 +305,25 @@ def main(args):
             age_bins=age_bins,
         )
 
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.train_batch_size,
-        )
+        # Parallel decode workers (Snellius handback 2026-08-12): with the
+        # legacy default of 0 workers, one process decodes every sample and
+        # the GPUs idle ~90% of each step. num_workers=0 keeps the exact old
+        # behaviour; >0 requires the wds.split_by_worker stage in
+        # dataset_wds.py (already present) for correct shard coverage.
+        _num_workers = getattr(args, "dataloader_num_workers", 0)
+        _dl_kwargs = dict(batch_size=args.train_batch_size)
+        if _num_workers > 0:
+            _dl_kwargs.update(
+                num_workers=_num_workers,
+                pin_memory=getattr(args, "dataloader_pin_memory", True),
+                prefetch_factor=getattr(args, "dataloader_prefetch_factor", 4),
+                persistent_workers=True,
+            )
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, **_dl_kwargs)
 
         logger.info(f"dataset len {len(train_dataset)}")
         logger.info(f"dataloader len {len(train_dataloader)}")
+        logger.info(f"dataloader num_workers {_num_workers}")
     else:
         train_dataset = RGFineTuningImageDirectoryDataset(
             image_dir_path=args.image_dir,
@@ -344,11 +347,16 @@ def main(args):
         if accelerator.is_main_process:
             print("len(train_dataset)", len(train_dataset))
 
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            shuffle=True,
-            batch_size=args.train_batch_size,
-        )
+        _num_workers = getattr(args, "dataloader_num_workers", 0)
+        _dl_kwargs = dict(shuffle=True, batch_size=args.train_batch_size)
+        if _num_workers > 0:
+            _dl_kwargs.update(
+                num_workers=_num_workers,
+                pin_memory=getattr(args, "dataloader_pin_memory", True),
+                prefetch_factor=getattr(args, "dataloader_prefetch_factor", 4),
+                persistent_workers=True,
+            )
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, **_dl_kwargs)
     ##########################################################
     # LR Scheduler and math around the number of training steps.
     logger.info(f"dataloader len {len(train_dataloader)}")
@@ -360,12 +368,26 @@ def main(args):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
+    # The accelerate-prepared scheduler steps once per process per optimizer
+    # step. Without the num_processes factor the cosine completes early and
+    # cycles (rectified) — see config.py:scale_lr_steps_by_num_processes.
+    # Default False = legacy (cyclic) behaviour, bit-identical to prior runs.
+    _lr_step_scale = (
+        accelerator.num_processes
+        if getattr(args, "scale_lr_steps_by_num_processes", False)
+        else 1
+    )
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps * _lr_step_scale,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps * _lr_step_scale,
     )
+    if accelerator.is_main_process and _lr_step_scale != 1:
+        logger.info(
+            f"LR scheduler steps scaled by num_processes={_lr_step_scale}: "
+            f"single anneal ends at optimizer step {args.max_train_steps}"
+        )
 
     if accelerator.is_main_process:
         logger.info("lr_scheduler {}".format(lr_scheduler))
@@ -378,6 +400,8 @@ def main(args):
         models_to_prepare.append(text_encoder)
     if hcn is not None:
         models_to_prepare.append(hcn)
+    if film_adapter is not None:
+        models_to_prepare.append(film_adapter)
     if demographic_encoder is not None:
         models_to_prepare.append(demographic_encoder)
     
@@ -396,6 +420,9 @@ def main(args):
         idx += 1
     if hcn is not None:
         hcn = prepared[idx]
+        idx += 1
+    if film_adapter is not None:
+        film_adapter = prepared[idx]
         idx += 1
     if demographic_encoder is not None:
         demographic_encoder = prepared[idx]
@@ -560,9 +587,7 @@ def main(args):
         hcn,  # Add HCN parameter
         demographic_encoder,  # Add DemographicEncoder parameter (V4)
         fair_controller=fair_controller,
-        fairclip_model=fairclip_model,
-        fairclip_preprocess=fairclip_preprocess,
-        fairclip_loss_fn=fairclip_loss_fn,
+        film_adapter=film_adapter,  # Add FiLM adapter parameter (V5)
     )
 
     if fair_controller is not None:

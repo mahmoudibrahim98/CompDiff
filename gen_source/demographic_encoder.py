@@ -18,6 +18,7 @@ Auxiliary supervision:
     Applied to TOKENS (d_output dimension), not embeddings (d_hidden dimension)
     This ensures fusion/projection MUST preserve demographics (like HCN V7/V8)
 
+Authors: RoentGen V0.5 Team
 """
 
 import torch

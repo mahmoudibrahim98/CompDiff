@@ -1,5 +1,5 @@
 """
-Validation metrics for model checkpoints.
+Validation metrics for RoentGen-v2 model checkpoints.
 
 This module implements comprehensive validation metrics as described in the paper:
 1. Text Prompt Alignment: Disease AUROC, sex/race accuracy, age RMSE
@@ -17,61 +17,19 @@ import torch.nn.functional as F
 import torchxrayvision as xrv
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from sklearn.metrics import roc_auc_score, accuracy_score, roc_curve, auc
+from sklearn.metrics import roc_auc_score, accuracy_score
 from scipy.linalg import sqrtm
 from torchvision import transforms
 from skimage.metrics import structural_similarity as ssim
 import warnings
 from pathlib import Path
 import sys
-import os
-import shutil
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset as TorchDataset
-from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.mifid import MemorizationInformedFrechetInceptionDistance
-from torchmetrics.image.inception import InceptionScore
-
-# FairDiffusion fairness metrics imports
-try:
-    from fairlearn.metrics import (
-        demographic_parity_difference,
-        demographic_parity_ratio,
-        equalized_odds_difference,
-        equalized_odds_ratio
-    )
-except ImportError:
-    warnings.warn("fairlearn not installed. Fairness metrics will not be available.")
-    demographic_parity_difference = None
-    demographic_parity_ratio = None
-    equalized_odds_difference = None
-    equalized_odds_ratio = None
-
-from sklearn.utils import resample
 # Add project root to Python path
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-# Import age binning utilities from local dataset_wds module
-# The code previously in train_code is now in gen_source
-try:
-    from dataset_wds import get_default_age_bins, get_age_bins_from_num_bins
-except ImportError:
-    warnings.warn("dataset_wds module not found. Using default age binning functions.")
-    # Fallback implementations
-    def get_default_age_bins():
-        """Default age bins: [18, 40, 60, 80] creates bins [0-18, 18-40, 40-60, 60-80, 80+]"""
-        return [18, 40, 60, 80]
-    
-    def get_age_bins_from_num_bins(num_bins: int):
-        """Generate age bins from number of bins."""
-        if num_bins == 5:
-            return [18, 40, 60, 80]
-        elif num_bins == 10:
-            return [10, 20, 30, 40, 50, 60, 70, 80, 90]
-        else:
-            # Default to 5 bins
-            return [18, 40, 60, 80]
+# Import age binning utilities
+from dataset_wds import get_default_age_bins, get_age_bins_from_num_bins
 
 
 def age_to_bin(age: float, bins: list) -> int:
@@ -97,7 +55,7 @@ def age_to_bin(age: float, bins: list) -> int:
 
 class TextPromptAlignmentMetrics:
     """
-    Evaluates how accurately the model adheres to provided text prompts.
+    Evaluates how accurately RoentGen-v2 adheres to provided text prompts.
     Uses pretrained classifiers from Torch X-ray Vision (XRV) library.
     """
 
@@ -781,43 +739,60 @@ class RealSyntheticSimilarityMetrics:
             self.inception_model.eval()
 
     def _load_radimagenet(self):
-        """Lazy load RadImageNet ResNet50 model for medical FID computation.
-        Tries pretrained_models/fid_radnet first, then torch.hub."""
+        """Lazy load RadImageNet ResNet50 model for medical FID computation."""
         if self.radimagenet_model is None:
             import os
             import sys
+            
+            # Try loading from local path first
+            try:
+                print("Loading RadImageNet ResNet50 from local path...")
+                
+                # Default: <repo>/pretrained_models/fid_radnet (weights + the
+                # radimagenet-models package). RADIMAGENET_LOCAL_DIR overrides it.
+                _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                local_model_dir = os.environ.get(
+                    "RADIMAGENET_LOCAL_DIR",
+                    os.path.join(_repo_root, "pretrained_models", "fid_radnet"),
+                )
 
-            # Resolve repo root (parent of gen_source)
-            _this_dir = os.path.dirname(os.path.abspath(__file__))
-            _repo_root = os.path.dirname(_this_dir)
-            # pretrained_models/fid_radnet: weights (.pth) and radimagenet-models package
-            _fid_radnet_dir = os.path.join(_repo_root, "pretrained_models", "fid_radnet")
-            _radimagenet_package_dir = os.path.join(
-                _fid_radnet_dir, "radimagenet-models-main", "radimagenet-models-main"
-            )
-            weights_file = os.path.join(_fid_radnet_dir, "RadImageNet-ResNet50_notop.pth")
+                # Add the local model path to Python path
+                local_model_path = os.path.join(local_model_dir, "radimagenet-models-main", "radimagenet-models-main")
+                if local_model_path not in sys.path:
+                    sys.path.insert(0, local_model_path)
 
-            # Try loading from local pretrained_models/fid_radnet first
-            if os.path.exists(weights_file) and os.path.isdir(_radimagenet_package_dir):
-                try:
-                    print("Loading RadImageNet ResNet50 from local path...")
-                    if _radimagenet_package_dir not in sys.path:
-                        sys.path.insert(0, _radimagenet_package_dir)
-                    from radimagenet_models.models.resnet import radimagenet_resnet50
-                    print(f"Found local weights: {weights_file}")
-                    self.radimagenet_model = radimagenet_resnet50(model_dir=_fid_radnet_dir, progress=True)
-                    # Remove final FC layer to get features
-                    if hasattr(self.radimagenet_model, 'fc'):
-                        self.radimagenet_model.fc = nn.Identity()
-                    elif hasattr(self.radimagenet_model, 'classifier'):
-                        self.radimagenet_model.classifier = nn.Identity()
-                    self.radimagenet_model.to(self.device)
-                    self.radimagenet_model.eval()
-                    print("✓ RadImageNet ResNet50 loaded successfully from local path")
-                    return
-                except Exception as e:
-                    print(f"⚠️ Failed to load RadImageNet from local path: {e}")
-                    print("Falling back to torch.hub loading...")
+                # Import the model function
+                from radimagenet_models.models.resnet import radimagenet_resnet50
+                
+                # Check if weights file exists locally
+                weights_file = os.path.join(local_model_dir, "RadImageNet-ResNet50_notop.pth")
+                
+                if os.path.exists(weights_file):
+                    print(f"Found local weights file: {weights_file}")
+                    # Load model with local weights
+                    self.radimagenet_model = radimagenet_resnet50(model_dir=local_model_dir, progress=True)
+                else:
+                    print("Local weights file not found, downloading...")
+                    # This will download the weights to the local directory
+                    self.radimagenet_model = radimagenet_resnet50(model_dir=local_model_dir, progress=True)
+                
+                # Remove final FC layer to get features (spatial features before pooling)
+                # We'll do spatial averaging in the embedding extraction function
+                if hasattr(self.radimagenet_model, 'fc'):
+                    self.radimagenet_model.fc = nn.Identity()
+                elif hasattr(self.radimagenet_model, 'classifier'):
+                    self.radimagenet_model.classifier = nn.Identity()
+                
+                self.radimagenet_model.to(self.device)
+                self.radimagenet_model.eval()
+                print("✓ RadImageNet ResNet50 loaded successfully from local path")
+                return
+                    
+            except Exception as e:
+                import traceback
+                error_traceback = traceback.format_exc()
+                print(f"⚠️ Failed to load RadImageNet from local path: {e}")
+                print("Falling back to torch.hub loading...")
             
             # Fallback to torch.hub loading with retry logic
             max_retries = 3
@@ -2333,545 +2308,6 @@ class IntraPromptDiversityMetrics:
         return embeddings
 
 
-# ============================================================================
-# FairDiffusion Metrics Integration
-# ============================================================================
-
-def compute_auc_fairdiffusion(pred_prob, y, num_classes=2):
-    """
-    Compute AUC score for binary or multiclass classification.
-    Adapted from FairDiffusion classification_codebase/src/modules.py
-    
-    Args:
-        pred_prob: Prediction probabilities [N] for binary or [N, num_classes] for multiclass
-        y: Ground truth labels [N]
-        num_classes: Number of classes (2 for binary, >2 for multiclass)
-    
-    Returns:
-        AUC score
-    """
-    if torch.is_tensor(pred_prob):
-        pred_prob = pred_prob.detach().cpu().numpy()
-    if torch.is_tensor(y):
-        y = y.detach().cpu().numpy()
-
-    if num_classes == 2:
-        fpr, tpr, thresholds = roc_curve(y, pred_prob)
-        auc_val = auc(fpr, tpr)
-    elif num_classes > 2:
-        y_onehot = num_to_onehot(y, num_classes)
-        auc_val = roc_auc_score(y_onehot, pred_prob, average='macro', multi_class='ovr')
-
-    return auc_val
-
-
-def num_to_onehot(nums, num_to_class):
-    """Convert numeric labels to one-hot encoding."""
-    nums = nums.astype(int)
-    n_values = num_to_class
-    onehot_vec = np.eye(n_values)[nums]
-    return onehot_vec
-
-
-def prob_to_label(pred_prob):
-    """Convert probability predictions to one-hot label predictions."""
-    max_prob_indices = np.argmax(pred_prob, axis=1)
-    one_hot_vectors = np.zeros_like(pred_prob)
-    one_hot_vectors[np.arange(len(max_prob_indices)), max_prob_indices] = 1
-    return one_hot_vectors
-
-
-def numeric_to_one_hot(y, num_classes=None):
-    """Convert numeric labels to one-hot encoding."""
-    y = np.asarray(y, dtype=np.int32)
-    if num_classes is None:
-        num_classes = np.max(y) + 1
-    one_hot_array = np.zeros((len(y), num_classes))
-    one_hot_array[np.arange(len(y)), y] = 1
-    return one_hot_array
-
-
-def multiclass_demographic_parity(pred_prob, y, attrs):
-    """Compute multiclass demographic parity difference."""
-    if demographic_parity_difference is None:
-        raise ImportError("fairlearn is required for demographic parity metrics")
-    
-    pred_one_hot = prob_to_label(pred_prob)
-    gt_one_hot = numeric_to_one_hot(y)
-    
-    scores = []
-    for i in range(pred_one_hot.shape[1]):
-        tmp_score = demographic_parity_difference(
-            pred_one_hot[:, i],
-            gt_one_hot[:, i],
-            sensitive_features=attrs
-        )
-        scores.append(tmp_score)
-    
-    return np.mean(scores)
-
-
-def multiclass_equalized_odds(pred_prob, y, attrs):
-    """Compute multiclass equalized odds difference."""
-    if equalized_odds_difference is None:
-        raise ImportError("fairlearn is required for equalized odds metrics")
-    
-    pred_one_hot = prob_to_label(pred_prob)
-    gt_one_hot = numeric_to_one_hot(y)
-    
-    scores = []
-    for i in range(pred_one_hot.shape[1]):
-        tmp_score = equalized_odds_difference(
-            pred_one_hot[:, i],
-            gt_one_hot[:, i],
-            sensitive_features=attrs
-        )
-        scores.append(tmp_score)
-    
-    return np.mean(scores)
-
-
-def equity_scaled_accuracy(output, target, attrs, alpha=1.):
-    """
-    Compute equity-scaled accuracy.
-    Adapted from FairDiffusion classification_codebase/src/modules.py
-    """
-    es_acc = 0
-    if len(output.shape) >= 2:
-        overall_acc = np.sum(np.argmax(output, axis=1) == target) / target.shape[0]
-    else:
-        overall_acc = np.sum((output >= 0.5).astype(float) == target) / target.shape[0]
-    
-    tmp = 0
-    identity_wise_perf = []
-    identity_wise_num = []
-    
-    for one_attr in np.unique(attrs).astype(int):
-        pred_group = output[attrs == one_attr]
-        gt_group = target[attrs == one_attr]
-
-        if len(pred_group.shape) >= 2:
-            acc = np.sum(np.argmax(pred_group, axis=1) == gt_group) / gt_group.shape[0]
-        else:
-            acc = np.sum((pred_group >= 0.5).astype(float) == gt_group) / gt_group.shape[0]
-
-        identity_wise_perf.append(acc)
-        identity_wise_num.append(gt_group.shape[0])
-
-    for i in range(len(identity_wise_perf)):
-        tmp += np.abs(identity_wise_perf[i] - overall_acc)
-    
-    es_acc = (overall_acc / (alpha * tmp + 1))
-    
-    return es_acc
-
-
-def equity_scaled_AUC(output, target, attrs, alpha=1., num_classes=2):
-    """
-    Compute equity-scaled AUC.
-    Adapted from FairDiffusion classification_codebase/src/modules.py
-    """
-    es_auc = 0
-    tmp = 0
-    identity_wise_perf = []
-    identity_wise_num = []
-    
-    if num_classes == 2:
-        fpr, tpr, thresholds = roc_curve(target, output)
-        overall_auc = auc(fpr, tpr)
-    elif num_classes > 2:
-        y_onehot = num_to_onehot(target, num_classes)
-        overall_auc = roc_auc_score(y_onehot, output, average='macro', multi_class='ovr')
-
-    for one_attr in np.unique(attrs).astype(int):
-        pred_group = output[attrs == one_attr]
-        gt_group = target[attrs == one_attr]
-
-        if num_classes == 2:
-            fpr, tpr, thresholds = roc_curve(gt_group, pred_group)
-            group_auc = auc(fpr, tpr)
-        elif num_classes > 2:
-            y_onehot = num_to_onehot(gt_group, num_classes)
-            group_auc = roc_auc_score(y_onehot, pred_group, average='macro', multi_class='ovr')
-        
-        identity_wise_perf.append(group_auc)
-        identity_wise_num.append(gt_group.shape[0])
-
-    for i in range(len(identity_wise_perf)):
-        tmp += np.abs(identity_wise_perf[i] - overall_auc)
-    
-    es_auc = (overall_auc / (alpha * tmp + 1))
-
-    return es_auc
-
-
-def compute_between_group_disparity(auc_list, overall_auc):
-    """
-    Compute between-group disparity metrics.
-    Returns (std_disparity, max_disparity) normalized by overall_auc.
-    """
-    if overall_auc == 0:
-        return np.nan, np.nan
-    return np.std(auc_list) / overall_auc, (np.max(auc_list) - np.min(auc_list)) / overall_auc
-
-
-def evalute_comprehensive_perf(preds, gts, attrs=None, num_classes=2):
-    """
-    Evaluate comprehensive performance metrics including fairness metrics.
-    Adapted from FairDiffusion classification_codebase/src/modules.py
-    
-    Args:
-        preds: Predictions [N] or [N, num_classes]
-        gts: Ground truth labels [N]
-        attrs: Attributes array [num_attrs, N] where each row is an attribute
-        num_classes: Number of classes
-    
-    Returns:
-        Tuple of (esaccs_by_attrs, esaucs_by_attrs, aucs_by_attrs, dpds, eods, between_group_disparity)
-    """
-    if attrs is None:
-        return [], [], [], [], [], []
-    
-    esaccs_by_attrs = []
-    esaucs_by_attrs = []
-    aucs_by_attrs = []
-    dpds = []
-    eods = []
-    between_group_disparity = []
-
-    overall_auc = compute_auc_fairdiffusion(preds, gts, num_classes=num_classes)
-
-    for i in range(attrs.shape[0]):
-        attr = attrs[i, :]
-
-        es_acc = equity_scaled_accuracy(preds, gts, attr)
-        esaccs_by_attrs.append(es_acc)
-
-        try:
-            es_auc = equity_scaled_AUC(preds, gts, attr, num_classes=num_classes)
-        except Exception as e:
-            es_auc = -1.
-        esaucs_by_attrs.append(es_auc)
-
-        aucs_by_group = []
-        elements = np.unique(attr).astype(int)
-        for e in elements:
-            try:
-                tmp_auc = compute_auc_fairdiffusion(preds[attr == e], gts[attr == e], num_classes=num_classes)
-            except Exception as e:
-                tmp_auc = -1.
-            aucs_by_group.append(tmp_auc)
-        aucs_by_attrs.append(aucs_by_group)
-        std_disparity, max_disparity = compute_between_group_disparity(aucs_by_group, overall_auc)
-        between_group_disparity.append([std_disparity, max_disparity])
-
-        pred_labels = (preds >= 0.5).astype(float)
-        if num_classes == 2:
-            if demographic_parity_difference is not None:
-                dpd = demographic_parity_difference(
-                    gts,
-                    pred_labels,
-                    sensitive_features=attr
-                )
-                eod = equalized_odds_difference(
-                    gts,
-                    pred_labels,
-                    sensitive_features=attr
-                )
-            else:
-                dpd = np.nan
-                eod = np.nan
-        elif num_classes > 2:
-            dpd = multiclass_demographic_parity(preds, gts, attr)
-            eod = multiclass_equalized_odds(preds, gts, attr)
-
-        dpds.append(dpd)
-        eods.append(eod)
-
-    return esaccs_by_attrs, esaucs_by_attrs, aucs_by_attrs, dpds, eods, between_group_disparity
-
-
-def evalute_comprehensive_perf_scores(preds, gts, attrs=None, num_classes=2):
-    """
-    Evaluate comprehensive performance with overall accuracy and AUC.
-    Adapted from FairDiffusion classification_codebase/src/modules.py
-    """
-    if attrs is None:
-        # Compute overall metrics only
-        overall_acc = accuracy_score(gts, (preds >= 0.5).astype(int)) if num_classes == 2 else accuracy_score(gts, np.argmax(preds, axis=1))
-        overall_auc = compute_auc_fairdiffusion(preds, gts, num_classes=num_classes)
-        return overall_acc, np.array([]), overall_auc, np.array([]), [], np.array([]), np.array([]), np.array([])
-    
-    esaccs_by_attrs = []
-    esaucs_by_attrs = []
-    aucs_by_attrs = []
-    dpds = []
-    eods = []
-    between_group_disparity = []
-
-    overall_acc = accuracy_score(gts, (preds >= 0.5).astype(int)) if num_classes == 2 else accuracy_score(gts, np.argmax(preds, axis=1))
-    overall_auc = compute_auc_fairdiffusion(preds, gts, num_classes=num_classes)
-
-    for i in range(attrs.shape[0]):
-        attr = attrs[i, :]
-
-        es_acc = equity_scaled_accuracy(preds, gts, attr)
-        esaccs_by_attrs.append(es_acc)
-        
-        try:
-            es_auc = equity_scaled_AUC(preds, gts, attr, num_classes=num_classes)
-        except Exception as e:
-            es_auc = -1.
-        esaucs_by_attrs.append(es_auc)
-
-        aucs_by_group = []
-        elements = np.unique(attr).astype(int)
-        for e in elements:
-            try:
-                tmp_auc = compute_auc_fairdiffusion(preds[attr == e], gts[attr == e], num_classes=num_classes)
-            except Exception as e:
-                tmp_auc = -1.
-            aucs_by_group.append(tmp_auc)
-        aucs_by_attrs.append(np.array(aucs_by_group))
-        std_disparity, max_disparity = compute_between_group_disparity(aucs_by_group, overall_auc)
-        between_group_disparity.append([std_disparity, max_disparity])
-
-        pred_labels = (preds >= 0.5).astype(float)
-        if num_classes == 2:
-            if demographic_parity_difference is not None:
-                dpd = demographic_parity_difference(
-                    gts,
-                    pred_labels,
-                    sensitive_features=attr
-                )
-                eod = equalized_odds_difference(
-                    gts,
-                    pred_labels,
-                    sensitive_features=attr
-                )
-            else:
-                dpd = np.nan
-                eod = np.nan
-        elif num_classes > 2:
-            dpd = multiclass_demographic_parity(preds, gts, attr)
-            eod = multiclass_equalized_odds(preds, gts, attr)
-
-        dpds.append(dpd)
-        eods.append(eod)
-
-    esaccs_by_attrs = np.array(esaccs_by_attrs)
-    esaucs_by_attrs = np.array(esaucs_by_attrs)
-    dpds = np.array(dpds)
-    eods = np.array(eods)
-    between_group_disparity = np.array(between_group_disparity)
-
-    return overall_acc, esaccs_by_attrs, overall_auc, esaucs_by_attrs, aucs_by_attrs, dpds, eods, between_group_disparity
-
-
-def bootstrap_performance(test_preds, test_gts, test_attrs, bootstrap_repeat_times=100, num_classes=2, num_attrs=3):
-    """
-    Compute bootstrap statistics for performance metrics.
-    Adapted from FairDiffusion classification_codebase/src/modules.py
-    """
-    test_acc, test_es_acc, test_auc, test_es_auc, test_aucs_by_attrs, test_dpds, test_eods, test_between_group_disparity = (
-        [], [], [], [], [[] for i in range(num_attrs)], [], [], []
-    )
-    
-    for i in range(bootstrap_repeat_times):
-        tmp_indices = np.array(list(range(0, test_gts.shape[0])))
-        bootstrap_indices = resample(tmp_indices, replace=True, n_samples=test_gts.shape[0])
-        bootstrap_preds = test_preds[bootstrap_indices]
-        bootstrap_gts = test_gts[bootstrap_indices]
-        bootstrap_attrs = []
-        for x in test_attrs:
-            bootstrap_attrs.append(x[bootstrap_indices])
-        bootstrap_attrs = np.vstack(bootstrap_attrs)
-        
-        tmp_test_acc, tmp_test_es_acc, tmp_test_auc, tmp_test_es_auc, tmp_test_aucs_by_attrs, tmp_test_dpds, tmp_test_eods, tmp_test_between_group_disparity = (
-            evalute_comprehensive_perf_scores(bootstrap_preds, bootstrap_gts, bootstrap_attrs, num_classes=num_classes)
-        )
-        
-        test_acc.append(tmp_test_acc)
-        test_es_acc.append(tmp_test_es_acc)
-        test_auc.append(tmp_test_auc)
-        test_es_auc.append(tmp_test_es_auc)
-        for j in range(len(test_aucs_by_attrs)):
-            test_aucs_by_attrs[j].append(tmp_test_aucs_by_attrs[j])
-        test_dpds.append(tmp_test_dpds)
-        test_eods.append(tmp_test_eods)
-        test_between_group_disparity.append(tmp_test_between_group_disparity)
-    
-    test_acc = np.vstack(test_acc)
-    test_es_acc = np.vstack(test_es_acc)
-    test_auc = np.vstack(test_auc)
-    test_es_auc = np.vstack(test_es_auc)
-    for j in range(len(test_aucs_by_attrs)):
-        test_aucs_by_attrs[j] = np.vstack(test_aucs_by_attrs[j])
-    test_dpds = np.vstack(test_dpds)
-    test_eods = np.vstack(test_eods)
-    test_between_group_disparity = np.array(test_between_group_disparity)[None, :, :]
-    test_between_group_disparity = np.vstack(test_between_group_disparity)
-
-    acc = np.mean(test_acc, axis=0)[0]
-    es_acc = np.mean(test_es_acc, axis=0)
-    auc_val = np.mean(test_auc, axis=0)[0]
-    es_auc = np.mean(test_es_auc, axis=0)
-    aucs_by_attrs = []
-    for j in range(len(test_aucs_by_attrs)):
-        aucs_by_attrs.append(np.mean(test_aucs_by_attrs[j], axis=0))
-    dpds = np.mean(test_dpds, axis=0)
-    eods = np.mean(test_eods, axis=0)
-    between_group_disparity = np.mean(test_between_group_disparity, axis=0)
-
-    acc_std = np.std(test_acc, axis=0)[0]
-    es_acc_std = np.std(test_es_acc, axis=0)
-    auc_std = np.std(test_auc, axis=0)[0]
-    es_auc_std = np.std(test_es_auc, axis=0)
-    aucs_by_attrs_std = []
-    for j in range(len(test_aucs_by_attrs)):
-        aucs_by_attrs_std.append(np.std(test_aucs_by_attrs[j], axis=0))
-    dpds_std = np.std(test_dpds, axis=0)
-    eods_std = np.std(test_eods, axis=0)
-    between_group_disparity_std = np.std(test_between_group_disparity, axis=0)
-
-    return (acc, es_acc, auc_val, es_auc, aucs_by_attrs, dpds, eods, between_group_disparity,
-            acc_std, es_acc_std, auc_std, es_auc_std, aucs_by_attrs_std, dpds_std, eods_std, between_group_disparity_std)
-
-
-class CustomImageDataset(TorchDataset):
-    """Custom dataset for loading images from directory."""
-    def __init__(self, directory, transform=None):
-        self.directory = directory
-        self.transform = transform
-        self.images = sorted([f for f in os.listdir(directory) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        img_name = os.path.join(self.directory, self.images[idx])
-        image = Image.open(img_name).convert('RGB')
-        if self.transform:
-            image = self.transform(image)
-        return image
-
-
-def compute_fairness_metrics_fairdiffusion(dir1, dir2, device="cuda", batch_size=100):
-    """
-    Compute FID, MIFID, and IS metrics between two image directories.
-    Adapted from FairDiffusion examples/text_to_image/evaluate_fairdiffusion.py
-    
-    Args:
-        dir1: Directory containing generated images
-        dir2: Directory containing real/reference images
-        device: Device to run computation on
-        batch_size: Batch size for processing
-    
-    Returns:
-        Dictionary with 'fid', 'mifid', 'is' keys
-    """
-    device_obj = torch.device(device if torch.cuda.is_available() else "cpu")
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: (x * 255).type(torch.uint8))
-    ])
-    
-    dataset1 = CustomImageDataset(directory=dir1, transform=transform)
-    dataloader1 = DataLoader(dataset1, batch_size=batch_size, shuffle=False)
-    dataset2 = CustomImageDataset(directory=dir2, transform=transform)
-    dataloader2 = DataLoader(dataset2, batch_size=batch_size, shuffle=False)
-
-    # FID
-    fid = FrechetInceptionDistance().to(device_obj)
-    fid.set_dtype(torch.float64)
-    for batch in dataloader1:
-        fid.update(batch.to(device_obj), real=False)
-    for batch in dataloader2:
-        fid.update(batch.to(device_obj), real=True)
-    fid_metric = fid.compute().item()
-
-    # MIFID
-    mifid = MemorizationInformedFrechetInceptionDistance().to(device_obj)
-    for batch in dataloader1:
-        mifid.update(batch.to(device_obj), real=False)
-    for batch in dataloader2:
-        mifid.update(batch.to(device_obj), real=True)
-    mifid_metric = mifid.compute().item()
-
-    # IS
-    inception = InceptionScore().to(device_obj)
-    for batch in dataloader1:
-        inception.update(batch.to(device_obj))
-    inception_metric = inception.compute()
-
-    return {'fid': fid_metric, 'mifid': mifid_metric, 'is': inception_metric}
-
-
-def compute_groupwise_metrics_fairdiffusion(
-    generated_dir, actual_dir, prompts_path, demographic_groups, 
-    device="cuda", batch_size=100, temp_dir_prefix="metrics_calculation"
-):
-    """
-    Compute metrics for different demographic groups.
-    Adapted from FairDiffusion examples/text_to_image/evaluate_fairdiffusion.py
-    
-    Args:
-        generated_dir: Directory containing generated images
-        actual_dir: Directory containing real images
-        prompts_path: Path to file containing prompts (one per line)
-        demographic_groups: List of demographic group strings to filter by
-        device: Device to run computation on
-        batch_size: Batch size for processing
-        temp_dir_prefix: Prefix for temporary directories
-    
-    Returns:
-        Dictionary mapping group names to metrics dictionaries
-    """
-    # Read prompts and categorize images
-    with open(prompts_path, 'r') as file:
-        prompts = file.readlines()
-    
-    group_metrics = {}
-    
-    # For each demographic group, filter images and calculate metrics
-    for group in demographic_groups:
-        group_prompts = [idx for idx, prompt in enumerate(prompts) if group in prompt]
-        if len(group_prompts) == 0:
-            continue
-        
-        tmp_dir_actual = f"{temp_dir_prefix}_tmp/actual/{group}"
-        tmp_dir_generated = f"{temp_dir_prefix}_tmp/generated/{group}"
-        os.makedirs(tmp_dir_actual, exist_ok=True)
-        os.makedirs(tmp_dir_generated, exist_ok=True)
-        
-        # Filter and save images for the current group
-        for idx in group_prompts:
-            actual_file = os.path.join(actual_dir, f"{idx}.jpg")
-            generated_file = os.path.join(generated_dir, f"{idx}.jpg")
-            if os.path.exists(actual_file):
-                shutil.copy(actual_file, os.path.join(tmp_dir_actual, f"{idx}.jpg"))
-            if os.path.exists(generated_file):
-                shutil.copy(generated_file, os.path.join(tmp_dir_generated, f"{idx}.jpg"))
-        
-        # Compute metrics for the current group
-        if len(os.listdir(tmp_dir_generated)) > 0 and len(os.listdir(tmp_dir_actual)) > 0:
-            metrics_dict = compute_fairness_metrics_fairdiffusion(
-                dir1=tmp_dir_generated, 
-                dir2=tmp_dir_actual,
-                device=device,
-                batch_size=batch_size
-            )
-            group_metrics[group] = metrics_dict
-        
-        # Clean up temporary directories after calculation
-        if os.path.exists(tmp_dir_actual):
-            shutil.rmtree(tmp_dir_actual)
-        if os.path.exists(tmp_dir_generated):
-            shutil.rmtree(tmp_dir_generated)
-    
-    return group_metrics
-
-
 class ValidationMetricsRunner:
     """
     Main runner for computing all validation metrics on a validation set.
@@ -2911,11 +2347,7 @@ class ValidationMetricsRunner:
         sex_labels: torch.Tensor,
         race_labels: torch.Tensor,
         age_labels: torch.Tensor,
-        images_per_prompt: Optional[List[torch.Tensor]] = None,
-        compute_fairdiffusion_metrics: bool = False,
-        prompts: Optional[List[str]] = None,
-        demographic_groups: Optional[List[str]] = None,
-        temp_dir_prefix: str = "metrics_calculation"
+        images_per_prompt: Optional[List[torch.Tensor]] = None
     ) -> Dict[str, float]:
         """
         Compute all validation metrics.
@@ -2985,74 +2417,6 @@ class ValidationMetricsRunner:
                 images_per_prompt
             )
 
-        # 4. FairDiffusion Metrics (if requested)
-        if compute_fairdiffusion_metrics:
-            print("Computing FairDiffusion metrics...")
-            
-            # Compute fairness metrics using classification predictions
-            # For this, we need predictions from a classifier model
-            # This would typically be done separately, but we can add a placeholder here
-            # The actual implementation would require classifier predictions
-            
-            # If prompts and demographic groups are provided, compute groupwise metrics
-            if prompts is not None and demographic_groups is not None:
-                # Save images temporarily for groupwise metric computation
-                import tempfile
-                with tempfile.TemporaryDirectory(prefix=temp_dir_prefix) as temp_dir:
-                    generated_dir = os.path.join(temp_dir, "generated")
-                    actual_dir = os.path.join(temp_dir, "actual")
-                    prompts_file = os.path.join(temp_dir, "prompts.txt")
-                    
-                    os.makedirs(generated_dir, exist_ok=True)
-                    os.makedirs(actual_dir, exist_ok=True)
-                    
-                    # Save images
-                    for idx in range(len(synthetic_images)):
-                        # Convert tensor to PIL and save
-                        syn_img = synthetic_images[idx]
-                        if syn_img.dim() == 3:
-                            syn_img = syn_img.unsqueeze(0)
-                        syn_img_np = syn_img.squeeze().cpu().numpy()
-                        if syn_img_np.shape[0] == 1:  # Grayscale
-                            syn_img_np = syn_img_np[0]
-                            syn_img_pil = Image.fromarray((syn_img_np * 255).clip(0, 255).astype(np.uint8), mode='L').convert('RGB')
-                        else:  # RGB
-                            syn_img_np = syn_img_np.transpose(1, 2, 0)
-                            syn_img_pil = Image.fromarray((syn_img_np * 255).clip(0, 255).astype(np.uint8), mode='RGB')
-                        syn_img_pil.save(os.path.join(generated_dir, f"{idx}.jpg"))
-                        
-                        real_img = real_images[idx]
-                        if real_img.dim() == 3:
-                            real_img = real_img.unsqueeze(0)
-                        real_img_np = real_img.squeeze().cpu().numpy()
-                        if real_img_np.shape[0] == 1:  # Grayscale
-                            real_img_np = real_img_np[0]
-                            real_img_pil = Image.fromarray((real_img_np * 255).clip(0, 255).astype(np.uint8), mode='L').convert('RGB')
-                        else:  # RGB
-                            real_img_np = real_img_np.transpose(1, 2, 0)
-                            real_img_pil = Image.fromarray((real_img_np * 255).clip(0, 255).astype(np.uint8), mode='RGB')
-                        real_img_pil.save(os.path.join(actual_dir, f"{idx}.jpg"))
-                    
-                    # Save prompts
-                    with open(prompts_file, 'w', encoding='utf-8') as f:
-                        for prompt in prompts:
-                            f.write(prompt + "\n")
-                    
-                    # Compute groupwise metrics
-                    group_metrics = compute_groupwise_metrics_fairdiffusion(
-                        generated_dir=generated_dir,
-                        actual_dir=actual_dir,
-                        prompts_path=prompts_file,
-                        demographic_groups=demographic_groups,
-                        device=self.device,
-                        temp_dir_prefix=temp_dir_prefix
-                    )
-                    
-                    # Add groupwise metrics to results
-                    for group, group_metric_dict in group_metrics.items():
-                        for metric_name, metric_value in group_metric_dict.items():
-                            metrics[f"{metric_name}_{group.replace(' ', '_')}"] = metric_value
-
         return metrics
 
     def print_metrics_summary(self, metrics: Dict[str, float]):
@@ -3098,13 +2462,5 @@ class ValidationMetricsRunner:
             print(f"  Intra-Prompt MS-SSIM:     {metrics['intra_prompt_ms_ssim']:.4f} (lower = more diverse)")
         if "intra_prompt_biovil_similarity" in metrics:
             print(f"  Intra-Prompt BioViL Sim:  {metrics['intra_prompt_biovil_similarity']:.4f} (lower = more diverse)")
-
-        print("\n4. FAIRDIFFUSION METRICS")
-        print("-" * 60)
-        # Check for FairDiffusion groupwise metrics
-        fairdiffusion_metrics = {k: v for k, v in metrics.items() if any(x in k for x in ['fid_', 'mifid_', 'is_'])}
-        if fairdiffusion_metrics:
-            for metric_name, metric_value in sorted(fairdiffusion_metrics.items()):
-                print(f"  {metric_name:30s}: {metric_value:.4f}")
 
         print("\n" + "="*60)

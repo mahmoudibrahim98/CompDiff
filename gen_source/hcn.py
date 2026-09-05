@@ -1,20 +1,37 @@
 """
-Hierarchical Conditioner Network: Auxiliary Loss on Output Token
+Hierarchical Conditioner Network (HCN) for Compositional Demographic Embeddings
 
-Key insight: auxiliary classifiers are applied to the OUTPUT TOKEN (after proj_ctx)
-rather than to mu. This forces the projection to preserve demographic information.
+Project context (RoentGen-v2):
+    We condition a chest X-ray diffusion model on clinical text + demographics (age, sex, race).
+    Putting demographics in the text prompt uses up CLIP's 77-token budget and hurts FID; removing
+    them improves FID but then the UNet has no demographic signal. HCN turns (age_idx, sex_idx,
+    race_idx) into a single embedding that can be injected as a token (V1), via FiLM (V5), or
+    via timestep embedding (V6)—so we can keep demographics out of the prompt and still control them.
 
-    h_child → mu_head → mu → proj_ctx → token → UNet
-                                          ↓
-                                  aux_classifiers ✓ (supervised here)
+This module implements a hierarchical approach to learning demographic representations
+for fairness in medical image generation. It addresses the data scarcity problem at
+demographic intersections by leveraging compositional structure.
+
+Architecture:
+    Grandparents (single attributes) → Parents (pairwise) → Child (triple) → Context
+
+Key Features:
+    - Compositional learning: Leverages abundant single-attribute data
+    - Uncertainty quantification: Knows when it's uncertain about rare groups
+    - Hierarchical composition: Age×Sex, Age×Race, Sex×Race → Age×Sex×Race
+
+Output modes (see forward() and config use_hcn_film / use_hcn_timestep_injection):
+    - Token: ctx [B, 1, d_ctx] concatenated with text embeddings (V1)
+    - FiLM:  ctx [B, d_node] passed to FiLM adapter for per-block modulation (V5)
+    - V6:    time_emb [B, d_time_emb] added to UNet timestep embedding; ctx is None
+
+See PROGRESS_LOG.md "HCN: Full Context" for version history and design rationale.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Dict
-import json
-import os
+from typing import Tuple, Optional, Dict, Union
 
 
 class MLP(nn.Module):
@@ -43,16 +60,15 @@ class MLP(nn.Module):
 
 class HierarchicalConditioner(nn.Module):
     """
-    Hierarchical Conditioning Network with Auxiliary Loss on Output Token
-    
-    Auxiliary classifiers are applied to the OUTPUT TOKEN (after proj_ctx)
-    rather than to mu. This forces the projection to preserve demographic information.
-    
-    Architecture:
-        Grandparents (single attributes) → Parents (pairwise) → Child (triple)
-        → mu/logsigma → sample z → proj_ctx → TOKEN → aux_classifiers
-                                                ↓
-                                              UNet
+    Hierarchical Conditioning Network for compositional demographic embeddings.
+
+    Learns demographic representations at three levels:
+    - Grandparents: Single attributes (age, sex, race)
+    - Parents: Pairwise compositions (age×sex, age×race, sex×race)
+    - Child: Triple composition (age×sex×race)
+
+    The hierarchical structure allows the model to leverage abundant data from
+    single attributes and pairs to improve representations of rare intersections.
 
     Args:
         num_age_bins: Number of age categories
@@ -62,13 +78,9 @@ class HierarchicalConditioner(nn.Module):
         d_ctx: Output dimension matching UNet cross_attention_dim (default: 1024)
         dropout: Dropout probability (default: 0.1)
         use_uncertainty: Whether to output mu/logsigma for variational sampling
-        use_aux_loss: Whether to include auxiliary classifiers (on token)
-        aux_hidden_dim: Hidden dimension for auxiliary classifiers (default: 512)
-        encode_age: Whether to include age in the hierarchy (default: True)
-                     If False, only sex × race composition is used
 
     Input:
-        age_idx: [B] Long tensor of age bin indices (0 to num_age_bins-1), optional if encode_age=False
+        age_idx: [B] Long tensor of age bin indices (0 to num_age_bins-1)
         sex_idx: [B] Long tensor of sex indices (0 to num_sex-1)
         race_idx: [B] Long tensor of race indices (0 to num_race-1)
 
@@ -76,9 +88,7 @@ class HierarchicalConditioner(nn.Module):
         ctx: [B, 1, d_ctx] - Demographic context token to concatenate with text
         mu: [B, d_node] - Mean of variational distribution
         logsigma: [B, d_node] - Log std of variational distribution
-        aux_logits: Dict with 'age' (if encode_age), 'sex', 'race' logits (from TOKEN, not mu)
     """
-    
     def __init__(
         self,
         num_age_bins: int,
@@ -88,9 +98,10 @@ class HierarchicalConditioner(nn.Module):
         d_ctx: int = 1024,
         dropout: float = 0.1,
         use_uncertainty: bool = True,
-        use_aux_loss: bool = True,
-        aux_hidden_dim: int = 512,  # V8: Hidden dim for token classifiers
-        encode_age: bool = True,  # V10: Optionally exclude age
+        use_aux_loss: bool = False,
+        use_film_output: bool = False,  # V5: Output hidden state for FiLM instead of token
+        use_timestep_injection: bool = False,  # V6: Output embedding to add to timestep
+        d_time_emb: int = 1280,  # V6: Timestep embedding dimension (1280 for SD 2.1)
     ):
         super().__init__()
 
@@ -104,8 +115,9 @@ class HierarchicalConditioner(nn.Module):
             'dropout': dropout,
             'use_uncertainty': use_uncertainty,
             'use_aux_loss': use_aux_loss,
-            'aux_hidden_dim': aux_hidden_dim,
-            'encode_age': encode_age,
+            'use_film_output': use_film_output,
+            'use_timestep_injection': use_timestep_injection,
+            'd_time_emb': d_time_emb,
         }
 
         self.num_age = num_age_bins
@@ -113,58 +125,45 @@ class HierarchicalConditioner(nn.Module):
         self.num_race = num_race
         self.d_node = d_node
         self.d_ctx = d_ctx
+        self.d_time_emb = d_time_emb
         self.use_uncertainty = use_uncertainty
         self.use_aux_loss = use_aux_loss
-        self.encode_age = encode_age
+        self.use_film_output = use_film_output
+        self.use_timestep_injection = use_timestep_injection
 
         # === Grandparent embeddings (single attributes) ===
+        self.emb_age = nn.Embedding(num_age_bins, d_node)
         self.emb_sex = nn.Embedding(num_sex, d_node)
         self.emb_race = nn.Embedding(num_race, d_node)
-        
-        if encode_age:
-            self.emb_age = nn.Embedding(num_age_bins, d_node)
-        else:
-            self.emb_age = None
 
         # === Parent composers (pairwise compositions) ===
-        if encode_age:
-            # Full hierarchy: age × sex × race
-            self.compose_age_sex = MLP(
-                d_in=2 * d_node,
-                d_hidden=2 * d_node,
-                d_out=d_node,
-                dropout=dropout
-            )
-            self.compose_age_race = MLP(
-                d_in=2 * d_node,
-                d_hidden=2 * d_node,
-                d_out=d_node,
-                dropout=dropout
-            )
-            self.compose_sex_race = MLP(
-                d_in=2 * d_node,
-                d_hidden=2 * d_node,
-                d_out=d_node,
-                dropout=dropout
-            )
-            # === Child composer (triple composition from all parents) ===
-            self.compose_all = MLP(
-                d_in=3 * d_node,
-                d_hidden=2 * d_node,
-                d_out=d_node,
-                dropout=dropout
-            )
-        else:
-            # Simplified: sex × race only
-            self.compose_age_sex = None
-            self.compose_age_race = None
-            self.compose_sex_race = MLP(
-                d_in=2 * d_node,
-                d_hidden=2 * d_node,
-                d_out=d_node,
-                dropout=dropout
-            )
-            self.compose_all = None
+        # These learn how age and sex interact, age and race interact, etc.
+        self.compose_age_sex = MLP(
+            d_in=2 * d_node,
+            d_hidden=2 * d_node,
+            d_out=d_node,
+            dropout=dropout
+        )
+        self.compose_age_race = MLP(
+            d_in=2 * d_node,
+            d_hidden=2 * d_node,
+            d_out=d_node,
+            dropout=dropout
+        )
+        self.compose_sex_race = MLP(
+            d_in=2 * d_node,
+            d_hidden=2 * d_node,
+            d_out=d_node,
+            dropout=dropout
+        )
+
+        # === Child composer (triple composition from all parents) ===
+        self.compose_all = MLP(
+            d_in=3 * d_node,  # Three parent embeddings
+            d_hidden=2 * d_node,
+            d_out=d_node,
+            dropout=dropout
+        )
 
         # === Uncertainty heads (for rare group detection) ===
         if use_uncertainty:
@@ -172,39 +171,45 @@ class HierarchicalConditioner(nn.Module):
             self.logsigma_head = nn.Linear(d_node, d_node)
 
         # === Project to UNet cross-attention dimension ===
-        self.proj_ctx = nn.Sequential(
-            nn.LayerNorm(d_node),
-            nn.Linear(d_node, d_ctx),
-        )
+        # Only create proj_ctx when NOT in FiLM/timestep mode (to avoid unused parameters in DDP)
+        if not use_film_output and not use_timestep_injection:
+            self.proj_ctx = nn.Sequential(
+                nn.LayerNorm(d_node),
+                nn.Linear(d_node, d_ctx),
+            )
+        else:
+            self.proj_ctx = None
+        
+        # === V6: Project to timestep embedding dimension ===
+        # This embedding gets added to the UNet's timestep embedding
+        if use_timestep_injection:
+            self.proj_time = nn.Sequential(
+                nn.LayerNorm(d_node),
+                nn.Linear(d_node, d_time_emb),
+                nn.SiLU(),
+                nn.Linear(d_time_emb, d_time_emb),
+            )
+            # Initialize to output near-zero (don't disrupt initial timestep embedding)
+            nn.init.zeros_(self.proj_time[-1].weight)
+            nn.init.zeros_(self.proj_time[-1].bias)
+        else:
+            self.proj_time = None
 
-        # === Auxiliary classifiers on OUTPUT TOKEN (d_ctx), not mu (d_node) ===
-        # This forces proj_ctx to preserve demographics
+        # === Auxiliary demographic classifiers (for diagnostic losses) ===
+        # Only include if use_aux_loss is True (matches v1 behavior when aux_weight=0)
         if use_aux_loss:
-            # More expressive classifiers since we're working from d_ctx
-            if encode_age:
-                self.age_classifier = nn.Sequential(
-                    nn.LayerNorm(d_ctx),
-                    nn.Linear(d_ctx, aux_hidden_dim),
-                    nn.SiLU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(aux_hidden_dim, num_age_bins),
-                )
-            else:
-                self.age_classifier = None
+            self.age_classifier = nn.Sequential(
+            nn.LayerNorm(d_node),
+            nn.Linear(d_node, num_age_bins),
+        )
             self.sex_classifier = nn.Sequential(
-                nn.LayerNorm(d_ctx),
-                nn.Linear(d_ctx, aux_hidden_dim),
-                nn.SiLU(),
-                nn.Dropout(dropout),
-                nn.Linear(aux_hidden_dim, num_sex),
-            )
+            nn.LayerNorm(d_node),
+            nn.Linear(d_node, num_sex),
+        )
             self.race_classifier = nn.Sequential(
-                nn.LayerNorm(d_ctx),
-                nn.Linear(d_ctx, aux_hidden_dim),
-                nn.SiLU(),
-                nn.Dropout(dropout),
-                nn.Linear(aux_hidden_dim, num_race),
-            )
+            nn.LayerNorm(d_node),
+            nn.Linear(d_node, num_race),
+        )
         else:
             self.age_classifier = None
             self.sex_classifier = None
@@ -214,10 +219,7 @@ class HierarchicalConditioner(nn.Module):
 
     def _init_weights(self):
         """Initialize embeddings with small normal distribution."""
-        embeddings = [self.emb_sex, self.emb_race]
-        if self.emb_age is not None:
-            embeddings.append(self.emb_age)
-        for emb in embeddings:
+        for emb in [self.emb_age, self.emb_sex, self.emb_race]:
             nn.init.normal_(emb.weight, mean=0.0, std=0.02)
 
         # Initialize uncertainty heads conservatively
@@ -229,42 +231,42 @@ class HierarchicalConditioner(nn.Module):
 
     def forward(
         self,
+        age_idx: torch.Tensor,
         sex_idx: torch.Tensor,
         race_idx: torch.Tensor,
-        age_idx: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]], Optional[torch.Tensor]]:
         """
         Forward pass through hierarchical conditioning network.
 
         Args:
+            age_idx: [B] Long tensor of age bin indices
             sex_idx: [B] Long tensor of sex indices
             race_idx: [B] Long tensor of race indices
-            age_idx: [B] Long tensor of age bin indices (optional if encode_age=False)
 
         Returns:
-            ctx: [B, 1, d_ctx] - Demographic context to concatenate with text
+            ctx: [B, 1, d_ctx] - Demographic context to concatenate with text (token mode)
+                 OR [B, d_node] - Hidden state for FiLM adapter (FiLM mode)
+                 OR None - When using timestep injection (V6 mode)
             mu: [B, d_node] - Mean of variational distribution
             logsigma: [B, d_node] - Log std of variational distribution
-            aux_logits: Dict with 'age' (if encode_age), 'sex', 'race' logits (FROM TOKEN)
-            time_emb: None - V8 does not support timestep injection
+            aux_logits: Optional dict with 'age', 'sex', 'race' logits
+            time_emb: [B, d_time_emb] - Timestep embedding to add to UNet (V6 mode)
+                      OR None - When not using timestep injection
         """
         # === Level 1: Grandparent embeddings (single attributes) ===
+        e_age = self.emb_age(age_idx)    # [B, d_node]
         e_sex = self.emb_sex(sex_idx)    # [B, d_node]
         e_race = self.emb_race(race_idx) # [B, d_node]
-        
-        if self.encode_age and age_idx is not None:
-            e_age = self.emb_age(age_idx)    # [B, d_node]
-            # === Level 2: Parent compositions (pairwise) ===
-            h_age_sex = self.compose_age_sex(torch.cat([e_age, e_sex], dim=-1))
-            h_age_race = self.compose_age_race(torch.cat([e_age, e_race], dim=-1))
-            h_sex_race = self.compose_sex_race(torch.cat([e_sex, e_race], dim=-1))
-            # === Level 3: Child composition (from all parents) ===
-            h_child = self.compose_all(
-                torch.cat([h_age_sex, h_age_race, h_sex_race], dim=-1)
-            )
-        else:
-            # === Simplified: sex × race only ===
-            h_child = self.compose_sex_race(torch.cat([e_sex, e_race], dim=-1))
+
+        # === Level 2: Parent compositions (pairwise) ===
+        h_age_sex = self.compose_age_sex(torch.cat([e_age, e_sex], dim=-1))
+        h_age_race = self.compose_age_race(torch.cat([e_age, e_race], dim=-1))
+        h_sex_race = self.compose_sex_race(torch.cat([e_sex, e_race], dim=-1))
+
+        # === Level 3: Child composition (from all parents) ===
+        h_child = self.compose_all(
+            torch.cat([h_age_sex, h_age_race, h_sex_race], dim=-1)
+        )
 
         # === Uncertainty quantification (variational) ===
         if self.use_uncertainty:
@@ -286,58 +288,74 @@ class HierarchicalConditioner(nn.Module):
             logsigma = torch.zeros_like(h_child)
             z = h_child
 
-        # === Project to context token ===
-        ctx = self.proj_ctx(z).unsqueeze(1)  # [B, 1, d_ctx]
+        # === Output depends on mode ===
+        time_emb = None  # V6: timestep embedding injection
+        
+        if self.use_timestep_injection:
+            # V6 mode: return timestep embedding to add to UNet's time_emb
+            # Shape: [B, d_time_emb]
+            time_emb = self.proj_time(z)
+            ctx = None  # No context token in V6 mode
+        elif self.use_film_output:
+            # FiLM mode (V5): return hidden state for FiLM adapter
+            # Shape: [B, d_node] - will be processed by FiLMAdapter
+            ctx = z  # Hidden state for FiLM adapter
+        else:
+            # Token mode (V1 behavior): project to context and add sequence axis
+            ctx = self.proj_ctx(z).unsqueeze(1)  # [B, 1, d_ctx]
 
-        # === Auxiliary logits FROM TOKEN (not from mu!) ===
-        # This forces proj_ctx to preserve demographics
-        aux_logits = None
+        # === Auxiliary logits (use mu which is deterministic at inference) ===
+        # Only compute if use_aux_loss is True (matches v1 behavior when aux_weight=0)
         if self.use_aux_loss:
-            token = ctx.squeeze(1)  # [B, d_ctx]
             aux_logits = {
-                "sex": self.sex_classifier(token),
-                "race": self.race_classifier(token),
-            }
-            if self.encode_age and self.age_classifier is not None:
-                aux_logits["age"] = self.age_classifier(token)
-
-        # Timestep injection not supported in this version, return None for compatibility
-        time_emb = None
+                "age": self.age_classifier(mu),
+                "sex": self.sex_classifier(mu),
+                "race": self.race_classifier(mu),
+        }
+        else:
+            aux_logits = None
 
         return ctx, mu, logsigma, aux_logits, time_emb
 
     def compute_compositional_loss(
         self,
+        age_idx: torch.Tensor,
         sex_idx: torch.Tensor,
-        race_idx: torch.Tensor,
-        age_idx: Optional[torch.Tensor] = None,
+        race_idx: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute compositional consistency loss.
 
         Enforces that the hierarchical composition is consistent with
         simple additive composition of grandparent embeddings.
+
+        Intuition: E(age, sex, race) should be predictable from
+        E(age) + E(sex) + E(race) in direction (not necessarily magnitude).
+
+        Args:
+            age_idx: [B] Age indices
+            sex_idx: [B] Sex indices
+            race_idx: [B] Race indices
+
+        Returns:
+            loss_comp: Scalar compositional loss (cosine-based)
         """
         # Get grandparent embeddings
+        e_age = self.emb_age(age_idx)
         e_sex = self.emb_sex(sex_idx)
         e_race = self.emb_race(race_idx)
-        
-        if self.encode_age and age_idx is not None:
-            e_age = self.emb_age(age_idx)
-            # Hierarchical composition
-            h_age_sex = self.compose_age_sex(torch.cat([e_age, e_sex], -1))
-            h_age_race = self.compose_age_race(torch.cat([e_age, e_race], -1))
-            h_sex_race = self.compose_sex_race(torch.cat([e_sex, e_race], -1))
-            h_child = self.compose_all(torch.cat([h_age_sex, h_age_race, h_sex_race], -1))
-            # Simple additive baseline
-            h_additive = e_age + e_sex + e_race
-        else:
-            # Simplified: sex × race only
-            h_child = self.compose_sex_race(torch.cat([e_sex, e_race], -1))
-            # Simple additive baseline
-            h_additive = e_sex + e_race
 
-        # Cosine similarity loss
+        # Hierarchical composition (normal forward pass)
+        h_age_sex = self.compose_age_sex(torch.cat([e_age, e_sex], -1))
+        h_age_race = self.compose_age_race(torch.cat([e_age, e_race], -1))
+        h_sex_race = self.compose_sex_race(torch.cat([e_sex, e_race], -1))
+        h_child = self.compose_all(torch.cat([h_age_sex, h_age_race, h_sex_race], -1))
+
+        # Simple additive baseline (perfect compositionality would match this)
+        h_additive = e_age + e_sex + e_race
+
+        # Cosine similarity (direction alignment, not magnitude)
+        # Loss = 1 - cos_sim, so 0 when perfectly aligned, 2 when opposite
         cos_sim = F.cosine_similarity(h_child, h_additive, dim=-1)
         loss_comp = (1 - cos_sim).mean()
 
@@ -345,20 +363,26 @@ class HierarchicalConditioner(nn.Module):
 
     def get_uncertainty(
         self,
+        age_idx: torch.Tensor,
         sex_idx: torch.Tensor,
-        race_idx: torch.Tensor,
-        age_idx: Optional[torch.Tensor] = None,
+        race_idx: torch.Tensor
     ) -> torch.Tensor:
         """
         Get uncertainty (sigma) for given demographic groups.
         Useful for detecting which groups the model is uncertain about.
+
+        Returns:
+            sigma: [B] - Standard deviation for each sample
         """
-        _, _, logsigma, _ = self.forward(sex_idx, race_idx, age_idx)
-        sigma = torch.exp(logsigma).mean(dim=-1)
+        _, _, logsigma = self.forward(age_idx, sex_idx, race_idx)
+        sigma = torch.exp(logsigma).mean(dim=-1)  # Average across dimensions
         return sigma
 
     def save_pretrained(self, save_dir: str):
         """Save HCN model and config."""
+        import os
+        import json
+
         os.makedirs(save_dir, exist_ok=True)
 
         # Save config
@@ -375,6 +399,9 @@ class HierarchicalConditioner(nn.Module):
     @classmethod
     def from_pretrained(cls, save_dir: str, device: str = "cpu"):
         """Load HCN model from saved checkpoint."""
+        import os
+        import json
+
         # Load config
         config_path = os.path.join(save_dir, "config.json")
         with open(config_path, "r") as f:
@@ -395,206 +422,19 @@ class HierarchicalConditioner(nn.Module):
         return model
 
 
-def compute_aux_loss(
-    aux_logits: Dict[str, torch.Tensor],
-    sex_idx: torch.Tensor,
-    race_idx: torch.Tensor,
-    age_idx: Optional[torch.Tensor] = None,
-    age_weight: float = 1.0,
-    sex_weight: float = 1.0,
-    race_weight: float = 1.0,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Compute auxiliary classification loss from token logits.
-    
-    Args:
-        aux_logits: Dict with 'age' (optional), 'sex', 'race' logits
-        sex_idx, race_idx: Ground truth labels
-        age_idx: Ground truth age labels (optional if age not encoded)
-        *_weight: Per-attribute loss weights
-        
-    Returns:
-        total_loss: Weighted sum of CE losses
-        metrics: Dict with individual losses and accuracies
-    """
-    losses = []
-    weights = []
-    metrics = {}
-    
-    sex_ce = F.cross_entropy(aux_logits["sex"], sex_idx)
-    race_ce = F.cross_entropy(aux_logits["race"], race_idx)
-    losses.append(sex_ce)
-    weights.append(sex_weight)
-    losses.append(race_ce)
-    weights.append(race_weight)
-    
-    # Compute accuracies for logging
-    with torch.no_grad():
-        sex_acc = (aux_logits["sex"].argmax(-1) == sex_idx).float().mean()
-        race_acc = (aux_logits["race"].argmax(-1) == race_idx).float().mean()
-    
-    metrics["aux_loss_sex"] = sex_ce.item()
-    metrics["aux_loss_race"] = race_ce.item()
-    metrics["aux_acc_sex"] = sex_acc.item()
-    metrics["aux_acc_race"] = race_acc.item()
-    
-    # Age loss (if age is encoded)
-    if "age" in aux_logits and age_idx is not None:
-        age_ce = F.cross_entropy(aux_logits["age"], age_idx)
-        losses.append(age_ce)
-        weights.append(age_weight)
-        with torch.no_grad():
-            age_acc = (aux_logits["age"].argmax(-1) == age_idx).float().mean()
-        metrics["aux_loss_age"] = age_ce.item()
-        metrics["aux_acc_age"] = age_acc.item()
-    
-    # Weighted average
-    total_loss = sum(w * l for w, l in zip(weights, losses)) / sum(weights)
-    
-    return total_loss, metrics
-
-
-def load_hcn(args, logger):
-    """
-    Load and initialize HCN.
-    
-    Args:
-        args: Training arguments/config
-        logger: Logger instance
-        
-    Returns:
-        hcn: HierarchicalConditioner instance or None
-    """
-    if not getattr(args, 'use_hcn', False):
-        logger.info("HCN disabled (use_hcn=False)")
-        return None
-    
-    logger.info("=" * 60)
-    logger.info("Initializing HCN (Auxiliary Loss on Token)")
-    logger.info("=" * 60)
-    
-    # Determine aux_loss setting
-    use_aux_loss = getattr(args, 'hcn_aux_weight', 0.0) > 0.0
-    aux_hidden_dim = getattr(args, 'hcn_aux_hidden_dim', 512)
-    encode_age = getattr(args, 'hcn_encode_age', True)  # V10: Optionally exclude age
-    
-    hcn = HierarchicalConditioner(
-        num_age_bins=getattr(args, 'hcn_num_age_bins', 5),
-        num_sex=getattr(args, 'hcn_num_sex', 2),
-        num_race=getattr(args, 'hcn_num_race', 4),
-        d_node=getattr(args, 'hcn_d_node', 256),
-        d_ctx=getattr(args, 'hcn_d_ctx', 1024),
-        dropout=getattr(args, 'hcn_dropout', 0.1),
-        use_uncertainty=getattr(args, 'hcn_use_uncertainty', True),
-        use_aux_loss=use_aux_loss,
-        aux_hidden_dim=aux_hidden_dim,
-        encode_age=encode_age,
-    )
-    
-    num_params = sum(p.numel() for p in hcn.parameters())
-    logger.info(f"  Total parameters: {num_params:,}")
-    logger.info(f"  Encode age: {encode_age}")
-    if encode_age:
-        logger.info(f"  Age bins: {hcn.num_age}")
-    logger.info(f"  Sex categories: {hcn.num_sex}")
-    logger.info(f"  Race categories: {hcn.num_race}")
-    logger.info(f"  Node dimension: {hcn.d_node}")
-    logger.info(f"  Context dimension: {hcn.d_ctx}")
-    logger.info(f"  Uncertainty: {hcn.use_uncertainty}")
-    logger.info(f"  Auxiliary loss (on token): {use_aux_loss}")
-    if use_aux_loss:
-        logger.info(f"  Auxiliary hidden dimension: {aux_hidden_dim}")
-    logger.info("=" * 60)
-    
-    return hcn
-
-
-# =============================================================================
-# Training loop integration example
-# =============================================================================
-
-def train_step(
-    hcn: HierarchicalConditioner,
-    batch: Dict[str, torch.Tensor],
-    encoder_hidden_states: torch.Tensor,
-    args,
-    global_step: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict]:
-    """
-    Training step - get HCN token and compute losses.
-    
-    Returns:
-        encoder_hidden_states: Modified with HCN token concatenated
-        kl_loss: KL divergence loss
-        comp_loss: Compositional consistency loss  
-        aux_loss: Auxiliary classification loss (on token)
-        logs: Dict of metrics to log
-    """
-    # Get HCN outputs
-    age_idx = batch.get("age_idx") if hcn.encode_age else None
-    hcn_ctx, mu, logsigma, aux_logits, _ = hcn(
-        sex_idx=batch["sex_idx"],
-        race_idx=batch["race_idx"],
-        age_idx=age_idx,
-    )
-    
-    # Concatenate HCN token to text embeddings
-    encoder_hidden_states = torch.cat(
-        [encoder_hidden_states, hcn_ctx], dim=1
-    )  # [B, 78, d_ctx]
-    
-    # Compute KL loss
-    kl_loss = -0.5 * torch.sum(
-        1 + 2 * logsigma - mu ** 2 - torch.exp(2 * logsigma),
-        dim=-1
-    ).mean()
-    
-    # Compute compositional loss (need unwrapped model for custom methods)
-    comp_loss = hcn.compute_compositional_loss(
-        sex_idx=batch["sex_idx"],
-        race_idx=batch["race_idx"],
-        age_idx=age_idx,
-    )
-    
-    # Compute auxiliary loss (on token)
-    aux_loss = None
-    logs = {
-        "hcn_ctx_norm": hcn_ctx.norm(dim=-1).mean().item(),
-        "kl_loss": kl_loss.item(),
-        "comp_loss": comp_loss.item(),
-    }
-    
-    if aux_logits is not None:
-        aux_loss, aux_metrics = compute_aux_loss(
-            aux_logits,
-            sex_idx=batch["sex_idx"],
-            race_idx=batch["race_idx"],
-            age_idx=age_idx,
-        )
-        logs.update(aux_metrics)
-        logs["aux_loss"] = aux_loss.item()
-    
-    return encoder_hidden_states, kl_loss, comp_loss, aux_loss, logs
-
-
-# =============================================================================
-# Tests
-# =============================================================================
-
 def test_hcn():
-    """Test HCN module."""
-    print("Testing HCN...")
-    print("=" * 60)
+    """Quick test of HCN module."""
+    print("Testing HCN module...")
 
-    # Create model
-    hcn = HierarchicalConditioner(
+    # Test HCN with aux_loss enabled
+    print("  Testing HCN with aux_loss=True...")
+    hcn_with_aux = HierarchicalConditioner(
         num_age_bins=5,
         num_sex=2,
         num_race=4,
         d_node=256,
         d_ctx=1024,
         use_aux_loss=True,
-        aux_hidden_dim=512,
     )
 
     batch_size = 8
@@ -602,106 +442,84 @@ def test_hcn():
     sex = torch.randint(0, 2, (batch_size,))
     race = torch.randint(0, 4, (batch_size,))
 
-    # Test forward pass with age
-    hcn.train()
-    ctx, mu, logsigma, aux_logits, time_emb = hcn(sex_idx=sex, race_idx=race, age_idx=age)
+    hcn_with_aux.train()
+    ctx, mu, logsigma, aux_logits = hcn_with_aux(age, sex, race)
 
     assert ctx.shape == (batch_size, 1, 1024), f"Expected (8, 1, 1024), got {ctx.shape}"
     assert mu.shape == (batch_size, 256), f"Expected (8, 256), got {mu.shape}"
     assert logsigma.shape == (batch_size, 256), f"Expected (8, 256), got {logsigma.shape}"
-    assert aux_logits is not None, "aux_logits should not be None"
-    assert time_emb is None, "time_emb should be None"
-    print(f"✓ Forward pass (with age): ctx shape = {ctx.shape}")
-
-    # Test that aux_logits have correct shapes
-    assert aux_logits["age"].shape == (batch_size, 5), f"Age logits wrong shape"
-    assert aux_logits["sex"].shape == (batch_size, 2), f"Sex logits wrong shape"
-    assert aux_logits["race"].shape == (batch_size, 4), f"Race logits wrong shape"
-    print(f"✓ Aux logits shapes correct")
-
-    # Test auxiliary loss computation
-    aux_loss, metrics = compute_aux_loss(aux_logits, sex_idx=sex, race_idx=race, age_idx=age)
-    assert aux_loss.ndim == 0, "Aux loss should be scalar"
-    print(f"✓ Aux loss: {aux_loss.item():.4f}")
-    print(f"  Age acc: {metrics['aux_acc_age']:.2%}")
-    print(f"  Sex acc: {metrics['aux_acc_sex']:.2%}")
-    print(f"  Race acc: {metrics['aux_acc_race']:.2%}")
-
-    # Test compositional loss
-    comp_loss = hcn.compute_compositional_loss(sex_idx=sex, race_idx=race, age_idx=age)
-    assert comp_loss.ndim == 0, "Compositional loss should be scalar"
-    print(f"✓ Compositional loss: {comp_loss.item():.4f}")
-
-    # Test uncertainty
-    sigma = hcn.get_uncertainty(sex_idx=sex, race_idx=race, age_idx=age)
-    assert sigma.shape == (batch_size,), f"Expected ({batch_size},), got {sigma.shape}"
-    print(f"✓ Uncertainty: mean sigma = {sigma.mean().item():.4f}")
-
-    # Test gradient flow through aux classifiers to proj_ctx
-    print("\n--- Testing gradient flow ---")
-    hcn.zero_grad()
-    ctx, _, _, aux_logits, _ = hcn(sex_idx=sex, race_idx=race, age_idx=age)
-    aux_loss, _ = compute_aux_loss(aux_logits, sex_idx=sex, race_idx=race, age_idx=age)
-    aux_loss.backward()
+    assert aux_logits is not None, "aux_logits should not be None when use_aux_loss=True"
+    assert all(k in aux_logits for k in ("age", "sex", "race"))
     
-    # Check that proj_ctx gets gradients from aux_loss
-    proj_ctx_grad = hcn.proj_ctx[1].weight.grad
-    assert proj_ctx_grad is not None, "proj_ctx should have gradients!"
-    assert proj_ctx_grad.abs().sum() > 0, "proj_ctx gradients should be non-zero!"
-    print(f"✓ proj_ctx gradient norm: {proj_ctx_grad.norm().item():.6f}")
-    print("  This confirms aux_loss flows back through proj_ctx!")
+    # Test HCN with aux_loss disabled (v1 behavior)
+    print("  Testing HCN with aux_loss=False...")
+    hcn_no_aux = HierarchicalConditioner(
+        num_age_bins=5,
+        num_sex=2,
+        num_race=4,
+        d_node=256,
+        d_ctx=1024,
+        use_aux_loss=False,
+    )
 
-    # Test save/load
-    print("\n--- Testing save/load ---")
-    import tempfile
-    import shutil
-    temp_dir = tempfile.mkdtemp()
-    try:
-        hcn.save_pretrained(temp_dir)
-        hcn_loaded = HierarchicalConditioner.from_pretrained(temp_dir)
-        ctx_loaded, _, _, aux_logits_loaded, _ = hcn_loaded(sex_idx=sex, race_idx=race, age_idx=age)
-        assert aux_logits_loaded is not None
-        print(f"✓ Save/load successful")
-    finally:
-        shutil.rmtree(temp_dir)
+    hcn_no_aux.train()
+    ctx, mu, logsigma, aux_logits = hcn_no_aux(age, sex, race)
+
+    assert ctx.shape == (batch_size, 1, 1024), f"Expected (8, 1, 1024), got {ctx.shape}"
+    assert mu.shape == (batch_size, 256), f"Expected (8, 256), got {mu.shape}"
+    assert logsigma.shape == (batch_size, 256), f"Expected (8, 256), got {logsigma.shape}"
+    assert aux_logits is None, "aux_logits should be None when use_aux_loss=False"
     
-    # Test without age encoding
-    print("\n--- Testing without age encoding ---")
-    hcn_no_age = HierarchicalConditionerV8(
+    # Test HCN with FiLM output mode (V5)
+    print("  Testing HCN with use_film_output=True (V5)...")
+    hcn_film = HierarchicalConditioner(
         num_age_bins=5,
         num_sex=2,
         num_race=4,
         d_node=256,
         d_ctx=1024,
         use_aux_loss=True,
-        aux_hidden_dim=512,
-        encode_age=False,
+        use_film_output=True,
     )
-    hcn_no_age.train()
-    ctx_no_age, mu_no_age, logsigma_no_age, aux_logits_no_age, _ = hcn_no_age(
-        sex_idx=sex, race_idx=race, age_idx=None
-    )
-    assert ctx_no_age.shape == (batch_size, 1, 1024), f"Expected (8, 1, 1024), got {ctx_no_age.shape}"
-    assert "age" not in aux_logits_no_age, "Age should not be in aux_logits when encode_age=False"
-    assert "sex" in aux_logits_no_age, "Sex should be in aux_logits"
-    assert "race" in aux_logits_no_age, "Race should be in aux_logits"
-    print(f"✓ Forward pass (without age): ctx shape = {ctx_no_age.shape}")
-    
-    # Test auxiliary loss without age
-    aux_loss_no_age, metrics_no_age = compute_aux_loss(
-        aux_logits_no_age, sex_idx=sex, race_idx=race, age_idx=None
-    )
-    assert aux_loss_no_age.ndim == 0, "Aux loss should be scalar"
-    assert "aux_acc_age" not in metrics_no_age, "Age metrics should not exist"
-    print(f"✓ Aux loss (no age): {aux_loss_no_age.item():.4f}")
-    print(f"  Sex acc: {metrics_no_age['aux_acc_sex']:.2%}")
-    print(f"  Race acc: {metrics_no_age['aux_acc_race']:.2%}")
 
-    # Summary
-    print("\n" + "=" * 60)
-    print("KEY DESIGN:")
-    print("  aux_classifiers(token)  - proj_ctx MUST preserve demographics")
-    print("=" * 60)
+    hcn_film.train()
+    ctx_film, mu_film, logsigma_film, aux_logits_film = hcn_film(age, sex, race)
+
+    # In FiLM mode, ctx should be [B, d_node] instead of [B, 1, d_ctx]
+    assert ctx_film.shape == (batch_size, 256), f"Expected (8, 256) in FiLM mode, got {ctx_film.shape}"
+    assert mu_film.shape == (batch_size, 256), f"Expected (8, 256), got {mu_film.shape}"
+    assert logsigma_film.shape == (batch_size, 256), f"Expected (8, 256), got {logsigma_film.shape}"
+    assert aux_logits_film is not None, "aux_logits should not be None when use_aux_loss=True"
+    print(f"✓ FiLM mode: ctx shape = {ctx_film.shape}")
+    
+    # Use hcn_with_aux for remaining tests
+    hcn = hcn_with_aux
+
+    print(f"✓ Forward pass: ctx shape = {ctx.shape}")
+
+    # Test compositional loss
+    comp_loss = hcn.compute_compositional_loss(age, sex, race)
+    assert comp_loss.ndim == 0, "Compositional loss should be scalar"
+    print(f"✓ Compositional loss: {comp_loss.item():.4f}")
+
+    # Test uncertainty
+    sigma = hcn.get_uncertainty(age, sex, race)
+    assert sigma.shape == (batch_size,), f"Expected ({batch_size},), got {sigma.shape}"
+    print(f"✓ Uncertainty: mean sigma = {sigma.mean().item():.4f}")
+
+    # Test save/load
+    import tempfile
+    import shutil
+    temp_dir = tempfile.mkdtemp()
+    try:
+        hcn_with_aux.save_pretrained(temp_dir)
+        hcn_loaded = HierarchicalConditioner.from_pretrained(temp_dir)
+        ctx_loaded, _, _, aux_logits_loaded = hcn_loaded(age, sex, race)
+        assert aux_logits_loaded is not None, "Loaded model should have aux_logits when use_aux_loss=True"
+        print(f"✓ Save/load successful")
+    finally:
+        shutil.rmtree(temp_dir)
+
     print(f"✓ All tests passed!")
     print(f"✓ Total parameters: {sum(p.numel() for p in hcn.parameters()):,}")
 

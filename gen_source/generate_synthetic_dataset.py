@@ -216,7 +216,45 @@ class SyntheticDatasetGenerator:
         self.hcn = None
         if self.use_hcn:
             try:
-                # Check if using ordinal age loss
+                if self.args.get("use_compdiff2", False):
+                    # CompDiff (typed compositional conditioner): sex, race and
+                    # continuous age composed inside the conditioner, emitted as
+                    # multiple cross-attention tokens. Must mirror models.py:load_hcn.
+                    from compdiff2 import CompDiff2Conditioner
+                    hcn_aux_weight = self.args.get("hcn_aux_weight", 0.0)
+                    self.hcn = CompDiff2Conditioner(
+                        num_sex=self.args.get("hcn_num_sex", 2),
+                        num_race=self.args.get("hcn_num_race", 4),
+                        num_age_bins=self.args.get("hcn_num_age_bins", 5),
+                        d_node=self.args.get("hcn_d_node", 256),
+                        d_ctx=self.args.get("hcn_d_ctx", 1024),
+                        d_time_emb=self.args.get("hcn_d_time_emb", 1280),
+                        max_age=self.args.get("max_age", 100),
+                        age_freq_dim=self.args.get("cd2_age_freq_dim", 128),
+                        composer=self.args.get("cd2_composer", "hierarchical"),
+                        multi_token=self.args.get("cd2_multi_token", False),
+                        route_b=self.args.get("cd2_route_b", False),
+                        num_registers=self.args.get("cd2_num_registers", 0),
+                        attr_dropout_prob=self.args.get("cd2_attr_dropout_prob", 0.0),
+                        full_dropout_prob=self.args.get("cd2_full_dropout_prob", 0.0),
+                        use_uncertainty=self.args.get("hcn_use_uncertainty", True),
+                        use_aux_loss=hcn_aux_weight > 0.0,
+                        aux_hidden_dim=self.args.get("hcn_aux_hidden_dim", 512),
+                        dropout=self.args.get("hcn_dropout", 0.1),
+                        transformer_layers=self.args.get("cd2_transformer_layers", 2),
+                        transformer_heads=self.args.get("cd2_transformer_heads", 4),
+                        flat_hidden=self.args.get("cd2_flat_hidden", 664),
+                    )
+                    if self.hcn.route_b:
+                        raise NotImplementedError(
+                            "cd2_route_b=true (timestep modulation) is not supported by "
+                            "generate_synthetic_dataset.py; use run_validation_monitor_debug.py"
+                        )
+                    if self.accelerator.is_local_main_process:
+                        logger.info(
+                            f"✓ CompDiff conditioner initialized (composer={self.hcn.composer_type}, "
+                            f"tokens={self.hcn.num_output_tokens})"
+                        )
                 elif self.args.get("hcn_age_loss_mode", "ce") != "ce":
                     from hcn_v8_ordinal import HierarchicalConditionerV8Ordinal
                     # Determine if auxiliary loss should be enabled based on hcn_aux_weight
@@ -555,14 +593,17 @@ class SyntheticDatasetGenerator:
         if self.hcn is None:
             return text_embeddings, None
 
-        # Check if using V9 (continuous age) - check both config and HCN type
+        # CompDiff-2 composes age as a continuous value (years); the older
+        # conditioners take the age bin index.
+        is_cd2 = bool(self.args.get("use_compdiff2", False))
         age_indices = []
+        age_continuous_values = []
         sex_indices = []
         race_indices = []
 
         for metadata in metadata_list:
             has_demographics = "sex_idx" in metadata and "race_idx" in metadata
-            has_age = "age_idx" in metadata
+            has_age = "age_idx" in metadata or "age_continuous" in metadata or "age" in metadata
             
             if has_demographics and has_age:
                 sex_idx = metadata["sex_idx"]
@@ -571,7 +612,12 @@ class SyntheticDatasetGenerator:
                 sex_indices.append(sex_idx)
                 race_indices.append(race_idx)
                 
-                if "age_idx" in metadata:
+                if is_cd2:
+                    age_val = metadata["age_continuous"] if "age_continuous" in metadata else metadata.get("age")
+                    if age_val is None:
+                        raise ValueError("CompDiff-2 needs a continuous age ('age_continuous' or 'age') per prompt")
+                    age_continuous_values.append(torch.as_tensor(age_val, dtype=torch.float32))
+                elif "age_idx" in metadata:
                     age_idx = metadata["age_idx"]
                     age_indices.append(age_idx)
 
@@ -588,7 +634,14 @@ class SyntheticDatasetGenerator:
             
             # HCN returns 5 values: ctx, mu, logsigma, aux_logits, time_emb
             # Call with appropriate arguments
-            if age_indices:
+            if is_cd2:
+                age_continuous_tensor = torch.stack(age_continuous_values).reshape(-1).to(self.accelerator.device)
+                hcn_ctx, _, _, _, time_emb = self.hcn(
+                    sex_idx=sex_indices,
+                    race_idx=race_indices,
+                    age_continuous=age_continuous_tensor,
+                )
+            elif age_indices:
                 # V7/V8: Check if V8 Ordinal (uses positional args) or V7/V8 (uses keyword args)
                 age_indices = torch.stack(age_indices).squeeze().to(self.accelerator.device)
                 if age_indices.dim() == 0:
@@ -740,19 +793,13 @@ class SyntheticDatasetGenerator:
         uncond_embeds = self.text_encoder(input_ids=uncond_input_ids, return_dict=False)
         uncond_embeddings = uncond_embeds[0]
 
-        # Ensure unconditional embeddings match conditional ones
-        if self.hcn is not None and hcn_time_emb is None:
-            # V1 token mode: add zero token to match conditional sequence length
+        # Ensure unconditional embeddings match conditional ones: append as many
+        # zero tokens as the conditioner(s) appended to the conditional branch
+        # (1 for the single-token HCN / DemographicEncoder, 4 for CompDiff-2).
+        num_extra = text_embeddings.shape[1] - uncond_embeddings.shape[1]
+        if num_extra > 0:
             zero_ctx = torch.zeros(
-                (uncond_embeddings.shape[0], 1, uncond_embeddings.shape[-1]),
-                device=uncond_embeddings.device,
-                dtype=uncond_embeddings.dtype,
-            )
-            uncond_embeddings = torch.cat([uncond_embeddings, zero_ctx], dim=1)
-
-        if self.demographic_encoder is not None:
-            zero_ctx = torch.zeros(
-                (uncond_embeddings.shape[0], 1, uncond_embeddings.shape[-1]),
+                (uncond_embeddings.shape[0], num_extra, uncond_embeddings.shape[-1]),
                 device=uncond_embeddings.device,
                 dtype=uncond_embeddings.dtype,
             )

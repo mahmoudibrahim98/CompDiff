@@ -1,9 +1,14 @@
 # CompDiff: Hierarchical Compositional Diffusion for Fair and Zero-Shot Intersectional Medical Image Generation
 
 CompDiff conditions Stable Diffusion on demographic attributes (age, sex, race/ethnicity)
-to generate fair, demographically-controllable synthetic medical images. It introduces a
-**Hierarchical Conditioner Network (HCN)** and ships alongside several baselines
-(Demographic Encoder, standard fine-tuning, FairDiffusion) for comparison.
+to generate fair, demographically-controllable synthetic medical images. Demographic
+attributes are removed from the text prompt and routed through a dedicated
+**Hierarchical Conditioner Network (HCN)**: a typed compositional conditioner that encodes
+each attribute in its native type (sex and race as embeddings, age as a continuous value),
+composes them hierarchically, and presents them to the diffusion UNet as separate,
+separately supervised cross-attention tokens. The repository ships the CompDiff training
+code alongside the baselines used in the paper (standard fine-tuning, FairDiffusion, and
+an unstructured demographic encoder) for comparison.
 
 **Project site:** [mahmoudibrahim98.github.io/compdiff-site](https://mahmoudibrahim98.github.io/compdiff-site/) ·
 **Paper:** [arXiv:2603.16551](https://arxiv.org/abs/2603.16551) ·
@@ -18,6 +23,7 @@ to generate fair, demographically-controllable synthetic medical images. It intr
 
 - [Installation](#installation)
 - [Quick start — generate images with our pretrained models](#quick-start--generate-images-with-our-pretrained-models)
+- [Released models](#released-models)
 - [How it works](#how-it-works)
 - [Train your own models](#train-your-own-models)
   - [1. Prepare data](#1-prepare-data)
@@ -44,27 +50,20 @@ conda activate compdiff
 pip install -r requirements.txt
 ```
 
-Install PyTorch with CUDA from [pytorch.org](https://pytorch.org/) for GPU support.
-Image generation additionally requires `diffusers>=0.35` (see
-[Quick start](#quick-start--generate-images-with-our-pretrained-models)).
+Install PyTorch with CUDA from [pytorch.org](https://pytorch.org/) for GPU support, matching
+your driver (a bare `pip install torch` may pull a CUDA build newer than your driver supports).
+Image generation requires `diffusers>=0.35` (already in `requirements.txt`).
 
 ---
 
 ## Quick start — generate images with our pretrained models
 
-Our best HCN checkpoints are released on the Hugging Face Hub. You do **not** need the
+The CompDiff checkpoints are released on the Hugging Face Hub. You do **not** need the
 training code or any dataset to generate images — each model ships a turnkey
 `CompDiffPipeline` that is downloaded automatically.
 
 - **Chest X-ray:** [mahmoudibra98/compdiff-chest-xray](https://huggingface.co/mahmoudibra98/compdiff-chest-xray)
 - **Fundus:** [mahmoudibra98/compdiff-fundus](https://huggingface.co/mahmoudibra98/compdiff-fundus)
-
-Generation requires `diffusers>=0.35` (all other dependencies are in `requirements.txt`):
-
-```bash
-pip install -r requirements.txt
-pip install "diffusers>=0.35"
-```
 
 ### Command line
 
@@ -84,7 +83,7 @@ python generate.py --modality fundus \
 ```
 
 Run `python generate.py --help` for all options (`--num_inference_steps`,
-`--guidance_scale`, `--negative_prompt`, `--dtype`, etc.).
+`--guidance_scale`, `--negative_prompt`, `--dtype`, `--revision`, etc.).
 
 ### Python
 
@@ -104,11 +103,14 @@ img.save("out.png")
 
 ### Conditioning conventions
 
-- **Prompt:** clinical findings only — do **not** include sex/race. They are injected
-  through the HCN. Age is prepended to the prompt automatically via `--age` / `age=`.
+- **Prompt:** clinical findings only — do **not** write age, sex or race into the text.
+  All three are passed as arguments and conditioned by the model.
 - **Sex:** `0=male`, `1=female` (strings like `male`/`female` also accepted).
 - **Race:** chest — `0=White, 1=Black/African American, 2=Asian, 3=Hispanic/Latino`;
   fundus — `0=White, 1=Black/African American, 2=Asian` (no Hispanic/Latino).
+- **Age:** a number of years. The chest model takes it as a continuous conditioner input
+  (no binning); the current fundus release prepends it to the prompt (see
+  [Released models](#released-models)).
 - **Fundus findings vocabulary** (comma-joined, in order): glaucoma status
   (`glaucoma`/`non-glaucoma`), vision loss (`normal vision`/`mild`/`moderate`/`severe vision loss`),
   optional cup-to-disc ratio, optional refraction (`hyperopia`/`emmetropia`/`myopia`).
@@ -119,26 +121,50 @@ img.save("out.png")
 
 ---
 
+## Released models
+
+| Model | Hub revision | Conditioner | Age |
+|---|---|---|---|
+| Chest X-ray (current) | `main` | typed 3-attribute HCN, 4 tokens (`configs/compdiff/train_compdiff_chest.yaml`) | continuous, through the conditioner |
+| Chest X-ray (first release, July 2026) | `v1` | sex × race HCN, 1 token (`configs/hcn/train_hcn_age_from_promt.yaml`) | prepended to the prompt |
+| Fundus (current) | `main` | sex × race HCN, 1 token | prepended to the prompt |
+
+The chest model on `main` is the checkpoint behind the current version of the paper. The
+fundus Hub model will be updated to the typed 3-attribute conditioner in the same way; until
+then it is the first release. Every release keeps the same `generate(prompt, sex, race, age, ...)`
+interface, and `generate.py --revision v1` selects the first chest release.
+
+---
+
 ## How it works
 
-CompDiff fine-tunes Stable Diffusion 2.1-base and injects demographic attributes through
-different conditioning modules. The methods below are all trained with the same pipeline
-and selected via config.
+CompDiff fine-tunes Stable Diffusion 2.1-base (UNet and CLIP text encoder) and injects
+demographic attributes through a dedicated conditioner instead of the prompt. The methods
+below are all trained with the same pipeline and selected via config.
 
-| Method | Description | Config | Use case |
-|--------|-------------|--------|----------|
-| **HCN** | Hierarchical composition (age×sex×race) + auxiliary loss | `configs/hcn/train_hcn_age_from_promt.yaml` | Best performance, structured encoding |
-| **Demographic Encoder (V4)** | Flat MLP, no hierarchy | `configs/v4/train_demographic_encoder.yaml` | Ablate the hierarchical architecture |
-| **v0 Baseline** | Standard SD fine-tuning (demographics in text only) | `configs/v0/train_baseline.yaml` | Baseline |
-| **FairDiffusion** | Adaptive per-sample re-weighting (Bayesian) | `configs/fairdiffusion/train_baseline_fairdiffusion.yaml` | Fairness-aware |
-| **HCN + FairDiffusion** | Both enabled | Set both flags in config | Ablation |
+| Method | Description | Config |
+|--------|-------------|--------|
+| **CompDiff** | Typed compositional HCN: sex/race embeddings + continuous age → pairwise composition → four supervised tokens | `configs/compdiff/train_compdiff_chest.yaml`, `configs/compdiff/train_compdiff_fundus.yaml` |
+| HCN, sex × race (first release) | Same hierarchy over sex and race only; age stays in the prompt; one fused token | `configs/hcn/train_hcn_age_from_promt.yaml` |
+| Demographic Encoder | Flat MLP over the attributes, no hierarchy (ablation) | `configs/FLAT/train_demographic_encoder.yaml` |
+| Baseline | Standard SD fine-tuning, demographics in the text prompt only | `configs/baseline_SD/train_baseline.yaml` |
+| FairDiffusion | Adaptive per-sample loss re-weighting (Fair Bayesian Perturbation) | `configs/fairdiffusion/train_baseline_fairdiffusion.yaml` |
 
-**Architecture:**
+**CompDiff conditioner (`gen_source/compdiff2.py`):**
 
-- **HCN:** Grandparents (age, sex, race) → Parents (pairwise) → Child (full composition);
-  produces a conditioning token plus auxiliary classifiers that preserve demographic information.
-- **Demographic Encoder:** Embeddings + MLP; single token or separate tokens for age, sex, race.
-- **Baselines:** v0 = demographics in text only; FairDiffusion = per-sample re-weighting.
+- **Typed encoders.** Sex and race are nominal embeddings; age enters as a continuous value
+  mapped through sinusoidal features and an MLP, so nearby ages get nearby representations.
+- **Hierarchical composition.** Pairwise MLPs compose age×sex, age×race and sex×race, a
+  further MLP fuses the three, and each attribute is re-contextualised against the composed
+  state. Every pairwise component of a never-observed intersection is supported by training
+  data from other cells, which is what makes zero-shot intersections reachable.
+- **Per-attribute tokens.** Four tokens (`t_age`, `t_sex`, `t_race`, `t_cls`) are projected
+  into the UNet cross-attention space and concatenated to the 77 CLIP text tokens
+  (`[B, 81, 1024]`). Each token is supervised by its own auxiliary head during training
+  (age regression, sex and race classification, joint-cell classification), so the tokens
+  the UNet reads carry the attribute information.
+- **Text pathway.** Demographics are stripped from every prompt; the text encoder only ever
+  sees clinical findings.
 
 ![Architecture Diagram](architecture.png)
 
@@ -181,6 +207,11 @@ python prepare_datasets/prepare_fundus_dataset.py \
 
 Use `--help` on each script for options (`--max_samples_per_tar`, `--splits`, etc.).
 
+Training prompts follow `"<AGE> year old <RACE> <SEX>. <IMPRESSION>"` for chest and
+`"SLO fundus image of a <RACE>, <SEX>, <AGE> years old patient with the following conditions: <CONDITIONS>"`
+for fundus; the data loader parses the demographics from the prompt and strips them from the
+text when a conditioner is enabled.
+
 **Demo data** — run the pipeline without the full datasets:
 
 - Pre-built WebDatasets in `demo_chest/` and `demo_fundus/`.
@@ -194,49 +225,57 @@ during training-time validation (not the released generators):
 - **Sex classifier:** `pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt` — demographic
   (sex) prediction on generated images. Configs point here by default.
 - **FID / RadImageNet:** `pretrained_models/fid_radnet/` — used when `compute_fid_radimagenet: true`
-  (falls back to `torch.hub` if absent). See `pretrained_models/README.md`.
+  (falls back to `torch.hub` if absent; `RADIMAGENET_LOCAL_DIR` overrides the location).
+  See `pretrained_models/README.md`.
 
 ### 2. Train
 
 ```bash
 cd gen_source
 
-# HCN
-python train.py --config_file ../configs/hcn/train_hcn_age_from_promt.yaml
+# CompDiff (chest)
+python train.py --config_file ../configs/compdiff/train_compdiff_chest.yaml
 
-# Demographic Encoder (V4)
-python train.py --config_file ../configs/v4/train_demographic_encoder.yaml
+# CompDiff (fundus)
+python train.py --config_file ../configs/compdiff/train_compdiff_fundus.yaml
 
 # Baseline
-python train.py --config_file ../configs/v0/train_baseline.yaml
+python train.py --config_file ../configs/baseline_SD/train_baseline.yaml
 
 # FairDiffusion
 python train.py --config_file ../configs/fairdiffusion/train_baseline_fairdiffusion.yaml
 ```
 
-Multi-GPU with [Accelerate](https://github.com/huggingface/accelerate):
+Multi-GPU with [Accelerate](https://github.com/huggingface/accelerate) (the chest model was
+trained on 6 GPUs at per-device batch 8, the fundus runs on 4 GPUs at per-device batch 24):
 
 ```bash
 accelerate launch --num_processes=6 --multi_gpu --mixed_precision bf16 \
-  gen_source/train.py --config_file configs/baseline_SD/train_baseline.yaml
+  gen_source/train.py --config_file configs/compdiff/train_compdiff_chest.yaml
 ```
+
+Set `dataloader_num_workers` to the number of training shards to keep the GPUs fed; the
+default of `0` decodes every sample on rank 0. Note that the WebDataset shuffle is not seeded
+by `seed`, so runs are independent replicates rather than exact repeats.
 
 ### 3. Monitor validation
 
 ```bash
 accelerate launch --num_processes=8 --multi_gpu --mixed_precision bf16 \
   gen_source/run_validation_monitor_debug.py \
-  --config_file configs/hcn/train_hcn_age_from_promt.yaml \
+  --config_file configs/compdiff/train_compdiff_chest.yaml \
   --check_interval 300
 ```
+
+Checkpoint selection in the paper is validation-based (chest: step 10,000; fundus: step 17,500).
 
 ### 4. Generate a synthetic dataset
 
 ```bash
 accelerate launch --num_processes=6 --multi_gpu --mixed_precision bf16 \
   gen_source/generate_synthetic_dataset.py \
-  --config_file configs/hcn/train_hcn_age_from_promt.yaml \
-  --checkpoint_path outputs/checkpoint-20000 \
+  --config_file configs/compdiff/train_compdiff_chest.yaml \
+  --checkpoint_path outputs/compdiff/chest/checkpoint-10000 \
   --output_dir synthetic_datasets/output \
   --merge_csv
 ```
@@ -262,7 +301,10 @@ See [downstream_eval_chest/README.md](downstream_eval_chest/README.md) for strat
 
 Main YAML options (see `configs/` for full examples):
 
-- **HCN:** `use_hcn: true`, `hcn_num_age_bins: 5`, `hcn_num_sex: 2`, `hcn_num_race: 4`, `hcn_aux_weight: 1.0`, `hcn_encode_age: false`
+- **CompDiff:** `use_hcn: true`, `use_compdiff2: true`, `cd2_composer: hierarchical`,
+  `cd2_multi_token: true`, `max_age: 100`, `hcn_num_sex: 2`, `hcn_num_race: 4` (chest) or `3` (fundus),
+  `hcn_aux_weight: 1`, `strip_demographics_in_validation: true`
+- **HCN, sex × race (first release):** `use_hcn: true`, `hcn_encode_age: false`, `keep_age_in_prompt: true`
 - **Demographic Encoder:** `use_demographic_encoder: true`, `demo_mode: 'single'`, `demo_aux_weight: 1.0`
 - **FairDiffusion:** `use_fairdiffusion: true`, `fairdiffusion_time_window: 30`, `fairdiffusion_exploitation_rate: 0.95`
 
@@ -270,10 +312,20 @@ Main YAML options (see `configs/` for full examples):
 
 ## Results
 
-![Cross-Modality Quality Metrics](cross_modality_quality_metrics.png)
+Mean ± SD across three independently trained runs per method (validation split), from the
+paper. Sampling: DDPM, 75 steps, classifier-free guidance 7.5, 512×512.
 
-*Cross-modality metrics (FID, MS-SSIM, BioViL, etc.) for HCN, Demographic Encoder,
-v0 baseline, and FairDiffusion.*
+| | Chest FID ↓ | Chest FID-RadImageNet ↓ | Fundus FID ↓ | Fundus glaucoma AUROC ↑ | Fundus cup-disc AUROC ↑ |
+|---|---|---|---|---|---|
+| Baseline (SD fine-tune) | 88.4 ± 4.7 | 8.62 ± 0.51 | 72.7 ± 3.7 | 0.916 | 0.957 |
+| FairDiffusion | 85.6 ± 1.7 | 8.85 ± 1.05 | 64.2 ± 1.8 | 0.930 | 0.904 |
+| **CompDiff** | **74.7 ± 5.7** | **6.64 ± 0.77** | **60.1 ± 4.3** | **0.957** | **0.994** |
+
+On two disjoint held-out splits of MIMIC-CXR, CompDiff synthesises demographic intersections
+absent from training and attains the lowest per-cell RadImageNet FID on 15 of 16 held-out
+cells against both baselines.
+
+![Overall generation quality](results_overall.png)
 
 ---
 
