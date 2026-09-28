@@ -37,14 +37,14 @@ gradient_checkpointing: true
 # ==============================================================================
 
 use_wds_dataset: true
-url_root: "./demo_chest/training_data"
+url_root: "./data/chest_webdataset/training_data"
 image_type: "pt"
 
 # ==============================================================================
 # TEST DATASET Generation
 # ==============================================================================
 
-wds_dataset_path: "./demo_chest/test_data"
+wds_dataset_path: "./data/chest_webdataset/test_data"
 num_images_per_prompt: 1
 generation_batch_size: 8
 
@@ -115,9 +115,9 @@ validation_schedule_offsets:
   - -1500
   - 0
 val_batch_size: 16 # 16 for a100, 8 for a5000 or rtx4090
-validation_csv: "./demo_chest/val_data"
-validation_images_dir: "./demo_chest/val_data"
-validation_sex_model_path: "./pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt"
+validation_csv: "./data/chest_webdataset/val_data"
+validation_images_dir: "./data/chest_webdataset/val_data"
+validation_sex_model_path: null  # unused: sex accuracy uses the torchxrayvision MIRA sex model (weights downloaded automatically)
 validation_num_images_per_prompt: 1
 validation_guidance_scale: 7.5
 validation_num_inference_steps: 75
@@ -127,7 +127,7 @@ compute_subgroup_metrics: true
 # Age is inside the conditioner for CompDiff-2 -> strip the FULL demographic
 # prefix (including age) from prompts, in training (dataset default) and here.
 strip_demographics_in_validation: true
-test_dir: "./demo_chest/test_data"
+test_dir: "./data/chest_webdataset/test_data"
 
 # ==============================================================================
 # LOGGING

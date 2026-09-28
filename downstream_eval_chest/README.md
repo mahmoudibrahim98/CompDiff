@@ -18,14 +18,14 @@ Run from the repository root so that `downstream_eval_chest` is on the Python pa
 ```bash
 python downstream_eval_chest/train_downstream_classifier.py \
     --strategy 1a \
-    --real_train_path demo_chest/training_data \
-    --real_val_path demo_chest/val_data \
-    --real_test_path demo_chest/test_data \
+    --real_train_path data/chest_webdataset/training_data \
+    --real_val_path data/chest_webdataset/val_data \
+    --real_test_path data/chest_webdataset/test_data \
     --output_dir outputs/downstream_eval \
     --compute_normalization
 ```
 
-Use WebDataset directories (with `.tar` and `*_size.txt` files) or CSV paths depending on your data. For the demo, `demo_chest/` contains WebDataset shards.
+Use WebDataset directories (with `.tar` and `*_size.txt` files) or CSV paths depending on your data. `prepare_datasets/prepare_chest_dataset.py --output_dir data/chest_webdataset` writes `training_data/`, `val_data/` and `test_data/` shards in this layout.
 
 ### Analyzing Saved Predictions
 
@@ -85,8 +85,8 @@ python downstream_eval_chest/train_downstream_classifier.py \
     --strategy 1b \
     --model_version v0 \
     --dataset_name 0_train_baseline \
-    --real_train_path demo_chest/training_data \
-    --real_val_path demo_chest/val_data \
+    --real_train_path data/chest_webdataset/training_data \
+    --real_val_path data/chest_webdataset/val_data \
     --synthetic_base_path synthetic_datasets
 
 # Train Model 1b with v7
@@ -94,8 +94,8 @@ python downstream_eval_chest/train_downstream_classifier.py \
     --strategy 1b \
     --model_version v7 \
     --dataset_name 6_train_hcn_age_from_promt \
-    --real_train_path demo_chest/training_data \
-    --real_val_path demo_chest/val_data \
+    --real_train_path data/chest_webdataset/training_data \
+    --real_val_path data/chest_webdataset/val_data \
     --synthetic_base_path synthetic_datasets
 ```
 
@@ -154,8 +154,8 @@ python downstream_eval_chest/train_downstream_classifier.py \
     --strategy 1a \
     --skip_training \
     --checkpoint_path outputs/downstream_eval/model_1a/checkpoint_best.pth \
-    --real_train_path demo_chest/training_data \
-    --real_val_path demo_chest/val_data \
+    --real_train_path data/chest_webdataset/training_data \
+    --real_val_path data/chest_webdataset/val_data \
     --evaluate_on_chexpert \
     --chexpert_csv_path /path/to/chexpert_filtered.csv \
     --chexpert_image_base_path /path/to/CheXpert-v1.0 \

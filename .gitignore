@@ -29,6 +29,7 @@ logs/
 
 # Large or local data (demo WebDatasets are large; host separately or download from release)
 demo_chest/
+data/
 demo_fundus/
 # real_chest/split_data.csv
 

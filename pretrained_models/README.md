@@ -6,9 +6,6 @@ This directory contains pretrained weights used for validation and evaluation.
 
 ```
 pretrained_models/
-├── sex/
-│   └── resnet-all/
-│       └── epoch=13-step=7125.ckpt   # Sex classifier for validation metrics
 ├── fid_radnet/
 │   ├── RadImageNet-ResNet50_notop.pth
 │   └── radimagenet-models-main/      # RadImageNet models (for FID / RadImageNet metrics)
@@ -17,8 +14,10 @@ pretrained_models/
 
 ## Sex model
 
-- **Path:** `sex/resnet-all/epoch=13-step=7125.ckpt`
-- **Use:** Validation monitor uses this checkpoint to predict sex from generated images and compute subgroup metrics. Set `validation_sex_model_path` in your config to this path (default in the provided configs).
+No checkpoint is needed. Sex accuracy on generated chest X-rays uses the MIRA sex model from
+[torchxrayvision](https://github.com/mlmed/torchxrayvision) (`xrv.baseline_models.mira.SexModel`),
+whose weights are downloaded automatically on first use. The `validation_sex_model_path` config
+key is kept for compatibility and is ignored.
 
 ## FID / RadImageNet
 

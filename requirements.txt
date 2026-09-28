@@ -14,7 +14,7 @@ webdataset>=0.2.0
 safetensors>=0.3.0  # Required for loading model checkpoints
 
 # Validation and metrics (required for validation_metrics.py)
-torchxrayvision>=0.0.30  # For X-ray specific metrics
+torchxrayvision>=1.4.0  # X-ray metrics incl. the MIRA sex model (tested with 1.4.0)
 scikit-learn>=1.3.0  # For ROC-AUC, accuracy, and other metrics
 scipy>=1.10.0  # For statistical functions (sqrtm, etc.)
 torchmetrics>=0.11.0  # For FID, MIFID, Inception Score

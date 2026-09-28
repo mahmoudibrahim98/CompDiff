@@ -40,7 +40,7 @@ gradient_checkpointing: true
 # ==============================================================================
 
 use_wds_dataset: true
-url_root: "./demo_chest/training_data"
+url_root: "./data/chest_webdataset/training_data"
 image_type: "pt"
 
 # ==============================================================================
@@ -48,7 +48,7 @@ image_type: "pt"
 # ==============================================================================
 
 
-wds_dataset_path: "./demo_chest/training_data"
+wds_dataset_path: "./data/chest_webdataset/training_data"
 num_images_per_prompt: 1
 generation_batch_size: 16
 generation_checkpoint_path: null
@@ -124,8 +124,8 @@ validation_schedule_offsets:  # . For example, with validation_steps: 2500 and v
 num_validation_samples: -1
 val_batch_size: 8
 validation_csv: null
-validation_images_dir: "./demo_chest/val_data"
-validation_sex_model_path: "./pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt"
+validation_images_dir: "./data/chest_webdataset/val_data"
+validation_sex_model_path: null  # unused: sex accuracy uses the torchxrayvision MIRA sex model (weights downloaded automatically)
 validation_num_images_per_prompt: 1
 validation_guidance_scale: 7.5
 validation_num_inference_steps: 75
@@ -140,10 +140,10 @@ strip_demographics_in_validation: false
 # ==============================================================================
 
 
-test_csv: "./demo_chest/test_data"
-test_images_dir: "./demo_chest/test_data"
-test_dir: "./demo_chest/test_data"
-train_dir: "./demo_chest/training_data"
+test_csv: "./data/chest_webdataset/test_data"
+test_images_dir: "./data/chest_webdataset/test_data"
+test_dir: "./data/chest_webdataset/test_data"
+train_dir: "./data/chest_webdataset/training_data"
 
 # ==============================================================================
 # GROUND TRUTH (GT) DATASET CONFIGURATION

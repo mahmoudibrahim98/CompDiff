@@ -37,7 +37,7 @@ gradient_checkpointing: true
 # ==============================================================================
 
 use_wds_dataset: true
-url_root: "./demo_chest/training_data"
+url_root: "./data/chest_webdataset/training_data"
 image_type: "pt"
 
 # ==============================================================================
@@ -45,7 +45,7 @@ image_type: "pt"
 # ==============================================================================
 
 
-wds_dataset_path: "./demo_chest/training_data"
+wds_dataset_path: "./data/chest_webdataset/training_data"
 num_images_per_prompt: 1
 generation_batch_size: 16
 generation_checkpoint_path: null  # Set to your checkpoint path after training, e.g. ./outputs/hcn/train_hcn_age_from_promt/checkpoint-20000
@@ -118,9 +118,9 @@ validation_schedule_offsets:
   - -1500
   - 0
 val_batch_size: 16 # 16 for a100, 8 for a5000 or rtx4090
-validation_csv: null  # Optional: path to validation CSV, e.g. ./demo_chest/val_data.csv
-validation_images_dir: "./demo_chest/val_data"
-validation_sex_model_path: "./pretrained_models/sex/resnet-all/epoch=13-step=7125.ckpt"
+validation_csv: null  # Optional: path to validation CSV, e.g. ./data/chest_webdataset/val_data.csv
+validation_images_dir: "./data/chest_webdataset/val_data"
+validation_sex_model_path: null  # unused: sex accuracy uses the torchxrayvision MIRA sex model (weights downloaded automatically)
 validation_num_images_per_prompt: 1
 validation_guidance_scale: 7.5
 validation_num_inference_steps: 75
@@ -129,8 +129,8 @@ validation_metrics_batch_size: 8 # always keep at 8, regardless of gpu memory
 compute_subgroup_metrics: true
 compute_fid_radimagenet: true  # FID with RadImageNet ResNet50 (uses pretrained_models/fid_radnet if present)
 strip_demographics_in_validation: true
-test_dir: "./demo_chest/test_data"
-train_dir: "./demo_chest/training_data"
+test_dir: "./data/chest_webdataset/test_data"
+train_dir: "./data/chest_webdataset/training_data"
 
 
 # ==============================================================================
