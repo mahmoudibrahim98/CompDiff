@@ -5,8 +5,8 @@
 Mahmoud K. Ibrahim, Bart Elen, Chang Sun, Ahmad Jiblawi, Mohammed M. Saleh, Maryam K. Ibrahim, Gökhan Ertaylan, Michel Dumontier
 
 [Project site](https://mahmoudibrahim98.github.io/compdiff-site/) ·
-[Models on Hugging Face](https://huggingface.co/collections/mahmoudibra98/compdiff-fair-intersectional-medical-image-generation-6a54b3ce9a66aa70a8ad534d) ·
-[arXiv (earlier conference version)](https://arxiv.org/abs/2603.16551)
+<img src="assets/huggingface.svg" height="16" alt=""> [Models on Hugging Face](https://huggingface.co/collections/mahmoudibra98/compdiff-fair-intersectional-medical-image-generation-6a54b3ce9a66aa70a8ad534d) ·
+[arXiv](https://arxiv.org/abs/2603.16551)
 
 Medical image generators trained on imbalanced data can fail at demographic intersections that are absent from training. CompDiff removes age, sex and race from the text prompt and passes them through a **Hierarchical Conditioner Network (HCN)**, which encodes each attribute separately and composes supervised demographic tokens that the diffusion UNet reads alongside the clinical text. On chest X-rays (MIMIC-CXR) and fundus images (FairGenMed), CompDiff improves overall and subgroup fidelity relative to prompt conditioning (RoentGen-v2) and loss reweighting (FairDiffusion), and it generates chest X-ray intersections that were removed from training.
 
@@ -309,7 +309,7 @@ The journal manuscript is under review. Until it is published, please cite:
 }
 ```
 
-An earlier conference version is available as [arXiv:2603.16551](https://arxiv.org/abs/2603.16551).
+Preprint: [arXiv:2603.16551](https://arxiv.org/abs/2603.16551).
 
 ---
 
