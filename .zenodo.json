@@ -1,0 +1,57 @@
+{
+  "title": "CompDiff: compositional diffusion for fair medical image generation (code, release v2.2-npjdm)",
+  "description": "Source code of CompDiff as used for the manuscript \"CompDiff enables fair and zero shot medical image generation across demographic intersections through compositional diffusion\" (submitted to npj Digital Medicine, September 2026). Tagged release v2.2-npjdm of https://github.com/mahmoudibrahim98/CompDiff, which remains the development mirror. Training, generation and evaluation code for the chest X-ray and fundus generators and the downstream classifier and audit experiments.",
+  "creators": [
+    {
+      "name": "Ibrahim, Mahmoud K.",
+      "affiliation": "Maastricht University; VITO",
+      "orcid": "0000-0002-5099-7609"
+    },
+    {
+      "name": "Elen, Bart",
+      "affiliation": "VITO"
+    },
+    {
+      "name": "Sun, Chang",
+      "affiliation": "Maastricht University"
+    },
+    {
+      "name": "Jiblawi, Ahmad",
+      "affiliation": "Icahn School of Medicine at Mount Sinai"
+    },
+    {
+      "name": "Saleh, Mohammed M.",
+      "affiliation": "Massachusetts General Hospital, Harvard Medical School"
+    },
+    {
+      "name": "Ibrahim, Maryam K.",
+      "affiliation": "Massachusetts General Hospital"
+    },
+    {
+      "name": "Ertaylan, Gökhan",
+      "affiliation": "VITO"
+    },
+    {
+      "name": "Dumontier, Michel",
+      "affiliation": "Maastricht University"
+    }
+  ],
+  "access_right": "open",
+  "license": "mit",
+  "keywords": [
+    "synthetic medical imaging",
+    "chest X-ray",
+    "diffusion models",
+    "algorithmic fairness",
+    "MIMIC-CXR",
+    "CompDiff"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://arxiv.org/abs/2603.16551",
+      "relation": "isSupplementTo",
+      "resource_type": "publication-preprint"
+    }
+  ],
+  "upload_type": "software"
+}

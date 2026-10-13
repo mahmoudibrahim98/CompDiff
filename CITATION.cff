@@ -1,0 +1,69 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the CompDiff manuscript (preferred-citation) and this release."
+title: "CompDiff: compositional diffusion for fair medical image generation"
+type: software
+version: v2.2-npjdm
+date-released: 2026-10-13
+license: MIT
+doi: 10.5281/zenodo.23339597
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23339597
+    description: "Zenodo archive of release v2.2-npjdm"
+repository-code: https://github.com/mahmoudibrahim98/CompDiff
+url: https://mahmoudibrahim98.github.io/compdiff-site/
+authors:
+  - family-names: Ibrahim
+    given-names: Mahmoud K.
+    orcid: https://orcid.org/0000-0002-5099-7609
+    affiliation: "Maastricht University; VITO"
+  - family-names: Elen
+    given-names: Bart
+    affiliation: VITO
+  - family-names: Sun
+    given-names: Chang
+    affiliation: Maastricht University
+  - family-names: Jiblawi
+    given-names: Ahmad
+    affiliation: Icahn School of Medicine at Mount Sinai
+  - family-names: Saleh
+    given-names: Mohammed M.
+    affiliation: "Massachusetts General Hospital, Harvard Medical School"
+  - family-names: Ibrahim
+    given-names: Maryam K.
+    affiliation: Massachusetts General Hospital
+  - family-names: Ertaylan
+    given-names: Gökhan
+    affiliation: VITO
+  - family-names: Dumontier
+    given-names: Michel
+    affiliation: Maastricht University
+keywords:
+  - synthetic medical imaging
+  - chest X-ray
+  - diffusion models
+  - algorithmic fairness
+  - MIMIC-CXR
+preferred-citation:
+  type: unpublished
+  title: "CompDiff enables fair and zero shot medical image generation across demographic intersections through compositional diffusion"
+  year: 2026
+  notes: "Manuscript under review; preprint arXiv:2603.16551"
+  url: https://arxiv.org/abs/2603.16551
+  authors:
+    - family-names: Ibrahim
+      given-names: Mahmoud K.
+    - family-names: Elen
+      given-names: Bart
+    - family-names: Sun
+      given-names: Chang
+    - family-names: Jiblawi
+      given-names: Ahmad
+    - family-names: Saleh
+      given-names: Mohammed M.
+    - family-names: Ibrahim
+      given-names: Maryam K.
+    - family-names: Ertaylan
+      given-names: Gökhan
+    - family-names: Dumontier
+      given-names: Michel
